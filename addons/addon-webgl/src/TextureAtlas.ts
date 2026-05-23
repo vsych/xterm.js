@@ -220,6 +220,36 @@ export class TextureAtlas implements ITextureAtlas {
     return flags;
   }
 
+  // Resolves the per-cell decoration color (used to tint underline/strikethrough/overline)
+  // into normalized RGBA. Falls back to the supplied fg color when the cell has no explicit
+  // underline color, matching the existing SGR 58 semantics.
+  public resolveDecoRgba(fg: number, ext: number, fgRgba: Float32Array, fgOffset: number, dst: Float32Array, dstOffset: number): void {
+    this._workAttributeData.fg = fg;
+    this._workAttributeData.bg = 0;
+    this._workAttributeData.extended.ext = ext;
+    if (this._workAttributeData.isUnderlineColorDefault()) {
+      dst[dstOffset    ] = fgRgba[fgOffset];
+      dst[dstOffset + 1] = fgRgba[fgOffset + 1];
+      dst[dstOffset + 2] = fgRgba[fgOffset + 2];
+      dst[dstOffset + 3] = fgRgba[fgOffset + 3];
+      return;
+    }
+    let rgba: number;
+    if (this._workAttributeData.isUnderlineColorRGB()) {
+      rgba = (this._workAttributeData.getUnderlineColor() << 8) | 0xFF;
+    } else {
+      let idx = this._workAttributeData.getUnderlineColor();
+      if (this._config.drawBoldTextInBrightColors && this._workAttributeData.isBold() && idx < 8) {
+        idx += 8;
+      }
+      rgba = this._getColorFromAnsiIndex(idx).rgba;
+    }
+    dst[dstOffset    ] = ((rgba >>> 24) & 0xFF) / 255;
+    dst[dstOffset + 1] = ((rgba >>> 16) & 0xFF) / 255;
+    dst[dstOffset + 2] = ((rgba >>> 8) & 0xFF) / 255;
+    dst[dstOffset + 3] = (rgba & 0xFF) / 255;
+  }
+
   // Resolves the per-cell foreground color into normalized RGBA, applying inverse,
   // dim and minimumContrastRatio adjustments. Returns true if the cell should not
   // render a glyph (the INVISIBLE flag was set, e.g. blinking text in its off phase).
@@ -433,10 +463,12 @@ export class TextureAtlas implements ITextureAtlas {
 
     const restrictedPowerlineGlyph = chars.length === 1 && isRestrictedPowerlineGlyph(chars.charCodeAt(0));
 
-    // Alpha-only rasterization: glyph drawn in white on a transparent canvas. The fragment
-    // shader tints by the per-cell fg color at draw time, so the same atlas entry serves any
-    // fg/bg combination — eliminating the cache-key explosion that drives atlas thrash.
-    this._tmpCtx.fillStyle = '#ffffff';
+    // Two-channel alpha rasterization: glyph coverage goes into the R channel and decoration
+    // (underline/strike/over) coverage into the G channel via additive blending. The fragment
+    // shader tints them separately with v_fgcolor and v_decoColor so e.g. custom underline
+    // colors survive without exploding the cache by fg/bg combinations.
+    this._tmpCtx.globalCompositeOperation = 'lighter';
+    this._tmpCtx.fillStyle = '#ff0000';
 
     const padding = restrictedPowerlineGlyph ? 0 : TMP_CANVAS_GLYPH_PADDING * 2;
 
@@ -452,13 +484,46 @@ export class TextureAtlas implements ITextureAtlas {
       chWidth = this._unicodeService.getStringCellWidth(codeOrChars);
     }
 
-    if (underline) {
+    if (!customGlyph) {
+      this._tmpCtx.fillText(chars, padding, padding + this._config.deviceCharHeight);
+    }
+
+    // Shift underscore up if it falls outside the cell.
+    if (chars === '_') {
+      let cellPixels = this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight);
+      if (checkCompletelyTransparent(cellPixels)) {
+        for (let offset = 1; offset <= 5; offset++) {
+          this._tmpCtx.clearRect(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
+          this._tmpCtx.fillText(chars, padding, padding + this._config.deviceCharHeight - offset);
+          cellPixels = this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight);
+          if (!checkCompletelyTransparent(cellPixels)) {
+            break;
+          }
+        }
+      }
+    }
+
+    // Detect color glyphs (e.g. emoji): the glyph font ignores our red fillStyle and writes
+    // its own RGB, so any G or B channel content means this is a colored glyph that should
+    // be sampled directly by the shader. Decorations don't apply to color glyphs.
+    let isColored = false;
+    {
+      const probe = this._tmpCtx.getImageData(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
+      for (let i = 0; i < probe.data.length; i += 4) {
+        if (probe.data[i + 1] > 0 || probe.data[i + 2] > 0) {
+          isColored = true;
+          break;
+        }
+      }
+    }
+
+    if (!isColored && underline) {
       this._tmpCtx.save();
       const lineWidth = Math.max(1, Math.floor(this._config.fontSize * this._config.devicePixelRatio / 15));
       const yOffset = lineWidth % 2 === 1 ? 0.5 : 0;
       this._tmpCtx.lineWidth = lineWidth;
-      this._tmpCtx.strokeStyle = '#ffffff';
-      this._tmpCtx.fillStyle = '#ffffff';
+      this._tmpCtx.strokeStyle = '#00ff00';
+      this._tmpCtx.fillStyle = '#00ff00';
 
       this._tmpCtx.beginPath();
       const xLeft = padding;
@@ -554,41 +619,22 @@ export class TextureAtlas implements ITextureAtlas {
       this._tmpCtx.restore();
     }
 
-    if (overline) {
+    if (!isColored && overline) {
       const lineWidth = Math.max(1, Math.floor(this._config.fontSize * this._config.devicePixelRatio / 15));
       const yOffset = lineWidth % 2 === 1 ? 0.5 : 0;
       this._tmpCtx.lineWidth = lineWidth;
-      this._tmpCtx.strokeStyle = '#ffffff';
+      this._tmpCtx.strokeStyle = '#00ff00';
       this._tmpCtx.beginPath();
       this._tmpCtx.moveTo(padding, padding + yOffset);
       this._tmpCtx.lineTo(padding + this._config.deviceCharWidth * chWidth, padding + yOffset);
       this._tmpCtx.stroke();
     }
 
-    if (!customGlyph) {
-      this._tmpCtx.fillText(chars, padding, padding + this._config.deviceCharHeight);
-    }
-
-    // Shift underscore up if it falls outside the cell.
-    if (chars === '_') {
-      let cellPixels = this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight);
-      if (checkCompletelyTransparent(cellPixels)) {
-        for (let offset = 1; offset <= 5; offset++) {
-          this._tmpCtx.clearRect(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
-          this._tmpCtx.fillText(chars, padding, padding + this._config.deviceCharHeight - offset);
-          cellPixels = this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight);
-          if (!checkCompletelyTransparent(cellPixels)) {
-            break;
-          }
-        }
-      }
-    }
-
-    if (strikethrough) {
+    if (!isColored && strikethrough) {
       const lineWidth = Math.max(1, Math.floor(this._config.fontSize * this._config.devicePixelRatio / 10));
       const yOffset = this._tmpCtx.lineWidth % 2 === 1 ? 0.5 : 0;
       this._tmpCtx.lineWidth = lineWidth;
-      this._tmpCtx.strokeStyle = '#ffffff';
+      this._tmpCtx.strokeStyle = '#00ff00';
       this._tmpCtx.beginPath();
       this._tmpCtx.moveTo(padding, padding + Math.floor(this._config.deviceCharHeight / 2) - yOffset);
       this._tmpCtx.lineTo(padding + this._config.deviceCharWidth * chWidth, padding + Math.floor(this._config.deviceCharHeight / 2) - yOffset);
@@ -601,19 +647,6 @@ export class TextureAtlas implements ITextureAtlas {
 
     if (checkCompletelyTransparent(imageData)) {
       return NULL_RASTERIZED_GLYPH;
-    }
-
-    // Detect non-grayscale pixels (e.g. color emoji) so the shader can sample directly
-    // instead of tinting.
-    let isColored = false;
-    for (let i = 0; i < imageData.data.length; i += 4) {
-      if (imageData.data[i + 3] === 0) {
-        continue;
-      }
-      if (imageData.data[i] !== imageData.data[i + 1] || imageData.data[i + 1] !== imageData.data[i + 2]) {
-        isColored = true;
-        break;
-      }
     }
 
     const rasterizedGlyph = this._findGlyphBoundingBox(imageData, this._workBoundingBox, allowedWidth, restrictedPowerlineGlyph, customGlyph, padding);

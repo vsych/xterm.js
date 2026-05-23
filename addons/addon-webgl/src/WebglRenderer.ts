@@ -43,6 +43,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
   private _rowHasBlinkingCellsCount: number = 0;
   private _workCell: ICellData = new CellData();
   private _workFgColor: Float32Array = new Float32Array(4);
+  private _workDecoColor: Float32Array = new Float32Array(4);
   private _cellColorResolver: CellColorResolver;
 
   private _canvas: HTMLCanvasElement;
@@ -570,7 +571,11 @@ export class WebglRenderer extends Disposable implements IRenderer {
           if (invisible) {
             this._workFgColor[3] = 0;
           }
-          this._glyphRenderer.value!.updateCell(x, y, code, styleFlags, chars, width, this._workFgColor[0], this._workFgColor[1], this._workFgColor[2], this._workFgColor[3], this._cellColorResolver.result.bg !== lastBg);
+          atlas.resolveDecoRgba(this._cellColorResolver.result.fg, this._cellColorResolver.result.ext, this._workFgColor, 0, this._workDecoColor, 0);
+          this._glyphRenderer.value!.updateCell(x, y, code, styleFlags, chars, width,
+            this._workFgColor[0], this._workFgColor[1], this._workFgColor[2], this._workFgColor[3],
+            this._workDecoColor[0], this._workDecoColor[1], this._workDecoColor[2], this._workDecoColor[3],
+            this._cellColorResolver.result.bg !== lastBg);
         }
 
         if (isJoined) {
@@ -580,7 +585,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
           // Null out non-first cells
           for (x++; x <= lastCharX; x++) {
             j = ((y * terminal.cols) + x) * RenderModelConstants.INDICIES_PER_CELL;
-            this._glyphRenderer.value!.updateCell(x, y, NULL_CELL_CODE, 0, NULL_CELL_CHAR, 0, 0, 0, 0, 0, false);
+            this._glyphRenderer.value!.updateCell(x, y, NULL_CELL_CODE, 0, NULL_CELL_CHAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
             this._model.cells[j] = NULL_CELL_CODE;
             // Don't re-resolve the cell color since multi-colored ligature backgrounds are not
             // supported

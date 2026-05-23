@@ -75,6 +75,7 @@ export interface ITextureAtlas extends IDisposable {
   getRasterizedGlyphCombinedChar(chars: string, styleFlags: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph;
   extractStyleFlags(fg: number, ext: number): number;
   resolveFgRgba(bg: number, fg: number, ext: number, charCode: number, dst: Float32Array, dstOffset: number): boolean;
+  resolveDecoRgba(fg: number, ext: number, fgRgba: Float32Array, fgOffset: number, dst: Float32Array, dstOffset: number): void;
 }
 
 /**

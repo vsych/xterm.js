@@ -32,7 +32,8 @@ const enum VertexAttribLocations {
   TEXPAGE = 4,
   TEXCOORD = 5,
   TEXSIZE = 6,
-  FGCOLOR = 7
+  FGCOLOR = 7,
+  DECOCOLOR = 8
 }
 
 const vertexShaderSource = `#version 300 es
@@ -44,6 +45,7 @@ layout (location = ${VertexAttribLocations.TEXPAGE}) in float a_texpage;
 layout (location = ${VertexAttribLocations.TEXCOORD}) in vec2 a_texcoord;
 layout (location = ${VertexAttribLocations.TEXSIZE}) in vec2 a_texsize;
 layout (location = ${VertexAttribLocations.FGCOLOR}) in vec4 a_fgcolor;
+layout (location = ${VertexAttribLocations.DECOCOLOR}) in vec4 a_decocolor;
 
 uniform mat4 u_projection;
 uniform vec2 u_resolution;
@@ -51,6 +53,7 @@ uniform vec2 u_resolution;
 out vec2 v_texcoord;
 flat out int v_texpage;
 flat out vec4 v_fgcolor;
+flat out vec4 v_decocolor;
 
 void main() {
   vec2 zeroToOne = (a_offset / u_resolution) + a_cellpos + (a_unitquad * a_size);
@@ -58,11 +61,14 @@ void main() {
   v_texpage = int(a_texpage);
   v_texcoord = a_texcoord + a_unitquad * a_texsize;
   v_fgcolor = a_fgcolor;
+  v_decocolor = a_decocolor;
 }`;
 
-// The atlas is a single Texture2DArray where each layer is one atlas page. The fragment
-// shader tints monochrome glyphs by v_fgcolor; a negative v_fgcolor.a means "this glyph
-// is colored (e.g. emoji), sample the texture directly without tinting".
+// Atlas layers store glyph coverage in the R channel and decoration coverage in the G
+// channel. The shader tints them separately with v_fgcolor and v_decocolor; decoration is
+// suppressed where the glyph is opaque so underlines don't run through descenders.
+// A negative v_fgcolor.a is the sentinel for "this glyph is colored (e.g. emoji), sample
+// the texture directly without tinting".
 const fragmentShaderSource = `#version 300 es
 precision lowp float;
 precision lowp sampler2DArray;
@@ -70,6 +76,7 @@ precision lowp sampler2DArray;
 in vec2 v_texcoord;
 flat in int v_texpage;
 flat in vec4 v_fgcolor;
+flat in vec4 v_decocolor;
 
 uniform sampler2DArray u_atlas;
 
@@ -77,13 +84,21 @@ out vec4 outColor;
 
 void main() {
   vec4 sampled = texture(u_atlas, vec3(v_texcoord, float(v_texpage)));
-  outColor = v_fgcolor.a < 0.0
-    ? sampled
-    : vec4(v_fgcolor.rgb, sampled.a * v_fgcolor.a);
+  if (v_fgcolor.a < 0.0) {
+    outColor = sampled;
+    return;
+  }
+  float glyphA = sampled.r * v_fgcolor.a;
+  float decoA = sampled.g * v_decocolor.a;
+  // Composite decoration over glyph in premultiplied form, then convert back to straight
+  // alpha for the gl.SRC_ALPHA blend func.
+  vec3 premul = v_decocolor.rgb * decoA + v_fgcolor.rgb * glyphA * (1.0 - decoA);
+  float a = decoA + glyphA * (1.0 - decoA);
+  outColor = a > 0.0 ? vec4(premul / a, a) : vec4(0.0);
 }`;
 
 const enum Constants {
-  INDICES_PER_CELL = 15,
+  INDICES_PER_CELL = 19,
   BYTES_PER_CELL = INDICES_PER_CELL * 4/* Float32Array.BYTES_PER_ELEMENT */,
   CELL_POSITION_INDICES = 2
 }
@@ -184,8 +199,11 @@ export class GlyphRenderer extends Disposable {
     gl.enableVertexAttribArray(VertexAttribLocations.FGCOLOR);
     gl.vertexAttribPointer(VertexAttribLocations.FGCOLOR, 4, gl.FLOAT, false, Constants.BYTES_PER_CELL, 9 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.FGCOLOR, 1);
+    gl.enableVertexAttribArray(VertexAttribLocations.DECOCOLOR);
+    gl.vertexAttribPointer(VertexAttribLocations.DECOCOLOR, 4, gl.FLOAT, false, Constants.BYTES_PER_CELL, 13 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribDivisor(VertexAttribLocations.DECOCOLOR, 1);
     gl.enableVertexAttribArray(VertexAttribLocations.CELL_POSITION);
-    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 13 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 17 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.CELL_POSITION, 1);
 
     gl.useProgram(this._program);
@@ -218,11 +236,11 @@ export class GlyphRenderer extends Disposable {
     return this._atlas ? this._atlas.beginFrame() : true;
   }
 
-  public updateCell(x: number, y: number, code: number, styleFlags: number, chars: string, width: number, fgR: number, fgG: number, fgB: number, fgA: number, leftClipBg: boolean): void {
-    this._updateCell(this._vertices.attributes, x, y, code, styleFlags, chars, width, fgR, fgG, fgB, fgA, leftClipBg);
+  public updateCell(x: number, y: number, code: number, styleFlags: number, chars: string, width: number, fgR: number, fgG: number, fgB: number, fgA: number, dR: number, dG: number, dB: number, dA: number, leftClipBg: boolean): void {
+    this._updateCell(this._vertices.attributes, x, y, code, styleFlags, chars, width, fgR, fgG, fgB, fgA, dR, dG, dB, dA, leftClipBg);
   }
 
-  private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, styleFlags: number, chars: string, width: number, fgR: number, fgG: number, fgB: number, fgA: number, leftClipBg: boolean): void {
+  private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, styleFlags: number, chars: string, width: number, fgR: number, fgG: number, fgB: number, fgA: number, dR: number, dG: number, dB: number, dA: number, leftClipBg: boolean): void {
     $i = (y * this._terminal.cols + x) * Constants.INDICES_PER_CELL;
 
     if (code === NULL_CELL_CODE || code === undefined) {
@@ -276,6 +294,11 @@ export class GlyphRenderer extends Disposable {
     array[$i + 10] = fgG;
     array[$i + 11] = fgB;
     array[$i + 12] = $glyph.isColored ? -1 : fgA;
+    // a_decocolor: tint for the decoration channel (underline / strikethrough / overline).
+    array[$i + 13] = dR;
+    array[$i + 14] = dG;
+    array[$i + 15] = dB;
+    array[$i + 16] = dA;
   }
 
   public clear(): void {
@@ -300,8 +323,8 @@ export class GlyphRenderer extends Disposable {
     i = 0;
     for (let y = 0; y < terminal.rows; y++) {
       for (let x = 0; x < terminal.cols; x++) {
-        this._vertices.attributes[i + 13] = x / terminal.cols;
-        this._vertices.attributes[i + 14] = y / terminal.rows;
+        this._vertices.attributes[i + 17] = x / terminal.cols;
+        this._vertices.attributes[i + 18] = y / terminal.rows;
         i += Constants.INDICES_PER_CELL;
       }
     }
