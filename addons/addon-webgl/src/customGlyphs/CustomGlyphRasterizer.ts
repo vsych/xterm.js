@@ -391,10 +391,14 @@ function drawPathNegativeDefinitionCharacter(
   // First, fill the entire cell with foreground color
   ctx.fillRect(xOffset, yOffset, deviceCellWidth, deviceCellHeight);
 
-  // Then draw the "negative" shape with the background color
+  // The cutout punches a hole in the alpha channel (destination-out) when no explicit bg
+  // color is provided — the alpha-only atlas renders glyphs on a transparent canvas, so a
+  // transparent cutout shows the cell background through at draw time.
   if (backgroundColor) {
     ctx.fillStyle = backgroundColor;
     ctx.strokeStyle = backgroundColor;
+  } else {
+    ctx.globalCompositeOperation = 'destination-out';
   }
 
   ctx.lineWidth = devicePixelRatio;

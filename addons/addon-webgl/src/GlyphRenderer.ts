@@ -31,7 +31,8 @@ const enum VertexAttribLocations {
   SIZE = 3,
   TEXPAGE = 4,
   TEXCOORD = 5,
-  TEXSIZE = 6
+  TEXSIZE = 6,
+  FGCOLOR = 7
 }
 
 const vertexShaderSource = `#version 300 es
@@ -42,44 +43,55 @@ layout (location = ${VertexAttribLocations.SIZE}) in vec2 a_size;
 layout (location = ${VertexAttribLocations.TEXPAGE}) in float a_texpage;
 layout (location = ${VertexAttribLocations.TEXCOORD}) in vec2 a_texcoord;
 layout (location = ${VertexAttribLocations.TEXSIZE}) in vec2 a_texsize;
+layout (location = ${VertexAttribLocations.FGCOLOR}) in vec4 a_fgcolor;
 
 uniform mat4 u_projection;
 uniform vec2 u_resolution;
 
 out vec2 v_texcoord;
 flat out int v_texpage;
+flat out vec4 v_fgcolor;
 
 void main() {
   vec2 zeroToOne = (a_offset / u_resolution) + a_cellpos + (a_unitquad * a_size);
   gl_Position = u_projection * vec4(zeroToOne, 0.0, 1.0);
   v_texpage = int(a_texpage);
   v_texcoord = a_texcoord + a_unitquad * a_texsize;
+  v_fgcolor = a_fgcolor;
 }`;
 
+// The atlas stores monochrome glyphs in white on a transparent canvas; the fragment
+// shader tints them by v_fgcolor at draw time. A negative v_fgcolor.a is the sentinel
+// for "this glyph is colored (e.g. emoji); sample the texture directly without tinting".
 function createFragmentShaderSource(maxFragmentShaderTextureUnits: number): string {
-  let textureConditionals = '';
+  let sampleBranches = '';
   for (let i = 1; i < maxFragmentShaderTextureUnits; i++) {
-    textureConditionals += ` else if (v_texpage == ${i}) { outColor = texture(u_texture[${i}], v_texcoord); }`;
+    sampleBranches += ` else if (v_texpage == ${i}) { sampled = texture(u_texture[${i}], v_texcoord); }`;
   }
   return (`#version 300 es
 precision lowp float;
 
 in vec2 v_texcoord;
 flat in int v_texpage;
+flat in vec4 v_fgcolor;
 
 uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
 
 out vec4 outColor;
 
 void main() {
+  vec4 sampled = vec4(0.0);
   if (v_texpage == 0) {
-    outColor = texture(u_texture[0], v_texcoord);
-  } ${textureConditionals}
+    sampled = texture(u_texture[0], v_texcoord);
+  } ${sampleBranches}
+  outColor = v_fgcolor.a < 0.0
+    ? sampled
+    : vec4(v_fgcolor.rgb, sampled.a * v_fgcolor.a);
 }`);
 }
 
 const enum Constants {
-  INDICES_PER_CELL = 11,
+  INDICES_PER_CELL = 15,
   BYTES_PER_CELL = INDICES_PER_CELL * 4/* Float32Array.BYTES_PER_ELEMENT */,
   CELL_POSITION_INDICES = 2
 }
@@ -176,8 +188,11 @@ export class GlyphRenderer extends Disposable {
     gl.enableVertexAttribArray(VertexAttribLocations.TEXSIZE);
     gl.vertexAttribPointer(VertexAttribLocations.TEXSIZE, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 7 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.TEXSIZE, 1);
+    gl.enableVertexAttribArray(VertexAttribLocations.FGCOLOR);
+    gl.vertexAttribPointer(VertexAttribLocations.FGCOLOR, 4, gl.FLOAT, false, Constants.BYTES_PER_CELL, 9 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribDivisor(VertexAttribLocations.FGCOLOR, 1);
     gl.enableVertexAttribArray(VertexAttribLocations.CELL_POSITION);
-    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 9 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 13 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.CELL_POSITION, 1);
 
     // Setup static uniforms
@@ -215,20 +230,14 @@ export class GlyphRenderer extends Disposable {
     return this._atlas ? this._atlas.beginFrame() : true;
   }
 
-  public updateCell(x: number, y: number, code: number, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number): void {
-    // Since this function is called for every cell (`rows*cols`), it must be very optimized. It
-    // should not instantiate any variables unless a new glyph is drawn to the cache where the
-    // slight slowdown is acceptable for the developer ergonomics provided as it's a once of for
-    // each glyph.
-    this._updateCell(this._vertices.attributes, x, y, code, bg, fg, ext, chars, width, lastBg);
+  public updateCell(x: number, y: number, code: number, styleFlags: number, chars: string, width: number, fgR: number, fgG: number, fgB: number, fgA: number, leftClipBg: boolean): void {
+    this._updateCell(this._vertices.attributes, x, y, code, styleFlags, chars, width, fgR, fgG, fgB, fgA, leftClipBg);
   }
 
-  private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number): void {
+  private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, styleFlags: number, chars: string, width: number, fgR: number, fgG: number, fgB: number, fgA: number, leftClipBg: boolean): void {
     $i = (y * this._terminal.cols + x) * Constants.INDICES_PER_CELL;
 
-    // Exit early if this is a null character, allow space character to continue as it may have
-    // underline/strikethrough styles
-    if (code === NULL_CELL_CODE || code === undefined/* This is used for the right side of wide chars */) {
+    if (code === NULL_CELL_CODE || code === undefined) {
       array.fill(0, $i, $i + Constants.INDICES_PER_CELL - 1 - Constants.CELL_POSITION_INDICES);
       return;
     }
@@ -237,55 +246,48 @@ export class GlyphRenderer extends Disposable {
       return;
     }
 
-    // Get the glyph
     if (chars && chars.length > 1) {
-      $glyph = this._atlas.getRasterizedGlyphCombinedChar(chars, bg, fg, ext, false, this._terminal.element);
+      $glyph = this._atlas.getRasterizedGlyphCombinedChar(chars, styleFlags, false, this._terminal.element);
     } else {
-      $glyph = this._atlas.getRasterizedGlyph(code, bg, fg, ext, false, this._terminal.element);
+      $glyph = this._atlas.getRasterizedGlyph(code, styleFlags, false, this._terminal.element);
     }
 
     $leftCellPadding = Math.floor((this._dimensions.device.cell.width - this._dimensions.device.char.width) / 2);
-    if (bg !== lastBg && $glyph.offset.x > $leftCellPadding) {
+    if (leftClipBg && $glyph.offset.x > $leftCellPadding) {
       $clippedPixels = $glyph.offset.x - $leftCellPadding;
-      // a_origin
       array[$i    ] = -($glyph.offset.x - $clippedPixels) + this._dimensions.device.char.left;
       array[$i + 1] = -$glyph.offset.y + this._dimensions.device.char.top;
-      // a_size
       array[$i + 2] = ($glyph.size.x - $clippedPixels) / this._dimensions.device.canvas.width;
       array[$i + 3] = $glyph.size.y / this._dimensions.device.canvas.height;
-      // a_texpage
       array[$i + 4] = $glyph.texturePage;
-      // a_texcoord
       array[$i + 5] = $glyph.texturePositionClipSpace.x + $clippedPixels / this._atlas.pages[$glyph.texturePage].canvas.width;
       array[$i + 6] = $glyph.texturePositionClipSpace.y;
-      // a_texsize
       array[$i + 7] = $glyph.sizeClipSpace.x - $clippedPixels / this._atlas.pages[$glyph.texturePage].canvas.width;
       array[$i + 8] = $glyph.sizeClipSpace.y;
     } else {
-      // a_origin
       array[$i    ] = -$glyph.offset.x + this._dimensions.device.char.left;
       array[$i + 1] = -$glyph.offset.y + this._dimensions.device.char.top;
-      // a_size
       array[$i + 2] = $glyph.size.x / this._dimensions.device.canvas.width;
       array[$i + 3] = $glyph.size.y / this._dimensions.device.canvas.height;
-      // a_texpage
       array[$i + 4] = $glyph.texturePage;
-      // a_texcoord
       array[$i + 5] = $glyph.texturePositionClipSpace.x;
       array[$i + 6] = $glyph.texturePositionClipSpace.y;
-      // a_texsize
       array[$i + 7] = $glyph.sizeClipSpace.x;
       array[$i + 8] = $glyph.sizeClipSpace.y;
     }
-    // a_cellpos only changes on resize
 
-    // Reduce scale horizontally for wide glyphs printed in cells that would overlap with the
-    // following cell (ie. the width is not 2).
     if (this._optionsService.rawOptions.rescaleOverlappingGlyphs) {
       if (allowRescaling(code, width, $glyph.size.x, this._dimensions.device.cell.width)) {
-        array[$i + 2] = (this._dimensions.device.cell.width - 1) / this._dimensions.device.canvas.width; // - 1 to improve readability
+        array[$i + 2] = (this._dimensions.device.cell.width - 1) / this._dimensions.device.canvas.width;
       }
     }
+
+    // a_fgcolor: rgb tint + alpha. Alpha < 0 tells the shader the glyph is colored (e.g. emoji)
+    // and to sample the texture directly instead of tinting.
+    array[$i + 9] = fgR;
+    array[$i + 10] = fgG;
+    array[$i + 11] = fgB;
+    array[$i + 12] = $glyph.isColored ? -1 : fgA;
   }
 
   public clear(): void {
@@ -310,8 +312,8 @@ export class GlyphRenderer extends Disposable {
     i = 0;
     for (let y = 0; y < terminal.rows; y++) {
       for (let x = 0; x < terminal.cols; x++) {
-        this._vertices.attributes[i + 9] = x / terminal.cols;
-        this._vertices.attributes[i + 10] = y / terminal.rows;
+        this._vertices.attributes[i + 13] = x / terminal.cols;
+        this._vertices.attributes[i + 14] = y / terminal.rows;
         i += Constants.INDICES_PER_CELL;
       }
     }

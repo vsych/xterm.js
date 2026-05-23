@@ -76,8 +76,10 @@ export interface ITextureAtlas extends IDisposable {
    * Clear all glyphs from the texture atlas.
    */
   clearTexture(): void;
-  getRasterizedGlyph(code: number, bg: number, fg: number, ext: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph;
-  getRasterizedGlyphCombinedChar(chars: string, bg: number, fg: number, ext: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph;
+  getRasterizedGlyph(code: number, styleFlags: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph;
+  getRasterizedGlyphCombinedChar(chars: string, styleFlags: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph;
+  extractStyleFlags(fg: number, ext: number): number;
+  resolveFgRgba(bg: number, fg: number, ext: number, charCode: number, dst: Float32Array, dstOffset: number): boolean;
 }
 
 /**
@@ -111,6 +113,20 @@ export interface IRasterizedGlyph {
    * The width and height of the glyph in the texture in clip space coordinates.
    */
   sizeClipSpace: IVector;
+  /**
+   * Frame counter when the glyph was last accessed, used for LRU eviction.
+   */
+  lastFrame: number;
+  /**
+   * Removes this glyph's entry from the texture atlas cacheMap. Set when the glyph is
+   * added to the cache. Undefined for shared sentinel glyphs (e.g. the null glyph).
+   */
+  removeFromCache?: () => void;
+  /**
+   * True if the rasterized glyph contains non-grayscale pixels (e.g. a color emoji); the
+   * fragment shader samples it directly instead of tinting by the foreground color.
+   */
+  isColored: boolean;
 }
 
 export interface IVector {

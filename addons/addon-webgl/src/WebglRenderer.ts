@@ -42,6 +42,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
   private _rowHasBlinkingCells: boolean[] = [];
   private _rowHasBlinkingCellsCount: number = 0;
   private _workCell: ICellData = new CellData();
+  private _workFgColor: Float32Array = new Float32Array(4);
   private _cellColorResolver: CellColorResolver;
 
   private _canvas: HTMLCanvasElement;
@@ -364,15 +365,19 @@ export class WebglRenderer extends Disposable implements IRenderer {
       return;
     }
 
-    // Tell renderer the frame is beginning
-    // upon a model clear also refresh the full viewport model
-    // (also triggered by an atlas page merge, part of #4480)
     if (this._glyphRenderer.value.beginFrame()) {
       this._clearModel(true);
       this._updateModel(0, this._terminal.rows - 1);
     } else {
-      // just update changed lines to draw
       this._updateModel(start, end);
+    }
+
+    // Eviction during _updateModel removes glyphs from the atlas cache. Re-run a full
+    // update until the atlas converges; in practice this is at most one extra pass.
+    let retries = 0;
+    while (this._charAtlas && this._glyphRenderer.value.beginFrame() && retries++ < 16) {
+      this._clearModel(true);
+      this._updateModel(0, this._terminal.rows - 1);
     }
 
     // Render
@@ -558,7 +563,15 @@ export class WebglRenderer extends Disposable implements IRenderer {
         this._model.cells[i + RenderModelConstants.EXT_OFFSET] = this._cellColorResolver.result.ext;
 
         width = cell.getWidth();
-        this._glyphRenderer.value!.updateCell(x, y, code, this._cellColorResolver.result.bg, this._cellColorResolver.result.fg, this._cellColorResolver.result.ext, chars, width, lastBg);
+        const atlas = this._charAtlas;
+        if (atlas) {
+          const styleFlags = atlas.extractStyleFlags(this._cellColorResolver.result.fg, this._cellColorResolver.result.ext);
+          const invisible = atlas.resolveFgRgba(this._cellColorResolver.result.bg, this._cellColorResolver.result.fg, this._cellColorResolver.result.ext, cell.getCode(), this._workFgColor, 0);
+          if (invisible) {
+            this._workFgColor[3] = 0;
+          }
+          this._glyphRenderer.value!.updateCell(x, y, code, styleFlags, chars, width, this._workFgColor[0], this._workFgColor[1], this._workFgColor[2], this._workFgColor[3], this._cellColorResolver.result.bg !== lastBg);
+        }
 
         if (isJoined) {
           // Restore work cell
@@ -567,7 +580,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
           // Null out non-first cells
           for (x++; x <= lastCharX; x++) {
             j = ((y * terminal.cols) + x) * RenderModelConstants.INDICIES_PER_CELL;
-            this._glyphRenderer.value!.updateCell(x, y, NULL_CELL_CODE, 0, 0, 0, NULL_CELL_CHAR, 0, 0);
+            this._glyphRenderer.value!.updateCell(x, y, NULL_CELL_CODE, 0, NULL_CELL_CHAR, 0, 0, 0, 0, 0, false);
             this._model.cells[j] = NULL_CELL_CODE;
             // Don't re-resolve the cell color since multi-colored ligature backgrounds are not
             // supported

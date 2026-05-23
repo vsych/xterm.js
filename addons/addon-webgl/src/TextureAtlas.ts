@@ -6,14 +6,14 @@
 import { IColorContrastCache } from 'browser/Types';
 import { DIM_OPACITY, TEXT_BASELINE } from './Constants';
 import { tryDrawCustomGlyph } from './customGlyphs/CustomGlyphRasterizer';
-import { computeNextVariantOffset, treatGlyphAsBackgroundColor, isPowerlineGlyph, isRestrictedPowerlineGlyph, throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
+import { computeNextVariantOffset, treatGlyphAsBackgroundColor, isRestrictedPowerlineGlyph, throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
 import { IBoundingBox, ICharAtlasConfig, IRasterizedGlyph, ITextureAtlas } from './Types';
 import { NULL_COLOR, channels, color, rgba } from 'common/Color';
-import { FourKeyMap } from 'common/MultiKeyMap';
+import { TwoKeyMap } from 'common/MultiKeyMap';
 import { IdleTaskQueue } from 'common/TaskQueue';
 import { IColor } from 'common/Types';
 import { AttributeData } from 'common/buffer/AttributeData';
-import { Attributes, DEFAULT_COLOR, DEFAULT_EXT, UnderlineStyle } from 'common/buffer/Constants';
+import { Attributes, UnderlineStyle } from 'common/buffer/Constants';
 import { ILogService, IUnicodeService } from 'common/services/Services';
 import { Emitter } from 'common/Event';
 
@@ -26,8 +26,22 @@ const NULL_RASTERIZED_GLYPH: IRasterizedGlyph = {
   texturePositionClipSpace: { x: 0, y: 0 },
   offset: { x: 0, y: 0 },
   size: { x: 0, y: 0 },
-  sizeClipSpace: { x: 0, y: 0 }
+  sizeClipSpace: { x: 0, y: 0 },
+  lastFrame: 0,
+  isColored: false
 };
+
+const enum StyleFlags {
+  BOLD = 1 << 0,
+  ITALIC = 1 << 1,
+  UNDERLINE = 1 << 2,
+  STRIKETHROUGH = 1 << 3,
+  OVERLINE = 1 << 4,
+  UNDERLINE_STYLE_SHIFT = 5,
+  UNDERLINE_STYLE_MASK = 0x7 << 5,
+  VARIANT_OFFSET_SHIFT = 8,
+  VARIANT_OFFSET_MASK = 0x3f << 8
+}
 
 const TMP_CANVAS_GLYPH_PADDING = 2;
 
@@ -57,8 +71,8 @@ let $glyph = undefined;
 export class TextureAtlas implements ITextureAtlas {
   private _didWarmUp: boolean = false;
 
-  private _cacheMap: FourKeyMap<number, number, number, number, IRasterizedGlyph> = new FourKeyMap();
-  private _cacheMapCombined: FourKeyMap<string, number, number, number, IRasterizedGlyph> = new FourKeyMap();
+  private _cacheMap: TwoKeyMap<number, number, IRasterizedGlyph> = new TwoKeyMap();
+  private _cacheMapCombined: TwoKeyMap<string, number, IRasterizedGlyph> = new TwoKeyMap();
 
   // The texture that the atlas is drawn to
   private _pages: AtlasPage[] = [];
@@ -75,7 +89,7 @@ export class TextureAtlas implements ITextureAtlas {
   private _workBoundingBox: IBoundingBox = { top: 0, left: 0, bottom: 0, right: 0 };
   private _workAttributeData: AttributeData = new AttributeData();
 
-  private _textureSize: number = 512;
+  private _textureSize: number = 1024;
 
   public static maxAtlasPages: number | undefined;
   public static maxTextureSize: number | undefined;
@@ -98,7 +112,7 @@ export class TextureAtlas implements ITextureAtlas {
       this._config.deviceCellHeight + TMP_CANVAS_GLYPH_PADDING * 2
     );
     this._tmpCtx = throwIfFalsy(this._tmpCanvas.getContext('2d', {
-      alpha: this._config.allowTransparency,
+      alpha: true,
       willReadFrequently: true
     }));
   }
@@ -123,17 +137,23 @@ export class TextureAtlas implements ITextureAtlas {
     const queue = new IdleTaskQueue(this._logService);
     for (let i = 33; i < 126; i++) {
       queue.enqueue(() => {
-        if (!this._cacheMap.get(i, DEFAULT_COLOR, DEFAULT_COLOR, DEFAULT_EXT)) {
-          const rasterizedGlyph = this._drawToCache(i, DEFAULT_COLOR, DEFAULT_COLOR, DEFAULT_EXT, false, undefined);
-          this._cacheMap.set(i, DEFAULT_COLOR, DEFAULT_COLOR, DEFAULT_EXT, rasterizedGlyph);
+        if (!this._cacheMap.get(i, 0)) {
+          const rasterizedGlyph = this._drawToCache(i, 0, false, undefined);
+          if (rasterizedGlyph !== NULL_RASTERIZED_GLYPH) {
+            this._cacheMap.set(i, 0, rasterizedGlyph);
+          }
         }
       });
     }
   }
 
   private _requestClearModel = false;
+  private _currentFrame = 0;
   public beginFrame(): boolean {
-    return this._requestClearModel;
+    this._currentFrame++;
+    const result = this._requestClearModel;
+    this._requestClearModel = false;
+    return result;
   }
 
   public clearTexture(): void {
@@ -149,66 +169,9 @@ export class TextureAtlas implements ITextureAtlas {
   }
 
   private _createNewPage(): AtlasPage {
-    // Try merge the set of the 4 most used pages of the largest size. This is is deferred to a
-    // microtask to ensure it does not interrupt textures that will be rendered in the current
-    // animation frame which would result in blank rendered areas. This is actually not that
-    // expensive relative to drawing the glyphs, so there is no need to wait for an idle callback.
-    if (TextureAtlas.maxAtlasPages && this._pages.length >= Math.max(4, TextureAtlas.maxAtlasPages)) {
-      // Find the set of the largest 4 images, below the maximum size, with the highest
-      // percentages used
-      const pagesBySize = this._pages.filter(e => {
-        return e.canvas.width * 2 <= (TextureAtlas.maxTextureSize || Constants.FORCED_MAX_TEXTURE_SIZE);
-      }).sort((a, b) => {
-        if (b.canvas.width !== a.canvas.width) {
-          return b.canvas.width - a.canvas.width;
-        }
-        return b.percentageUsed - a.percentageUsed;
-      });
-      let sameSizeI = -1;
-      let size = 0;
-      for (let i = 0; i < pagesBySize.length; i++) {
-        if (pagesBySize[i].canvas.width !== size) {
-          sameSizeI = i;
-          size = pagesBySize[i].canvas.width;
-        } else if (i - sameSizeI === 3) {
-          break;
-        }
-      }
-
-      // Gather details of the merge
-      const mergingPages = pagesBySize.slice(sameSizeI, sameSizeI + 4);
-
-      // Only proceed with merge if we have exactly 4 same-sized pages. If not, we cannot
-      // effectively reduce page count and merging would cause issues.
-      if (mergingPages.length < 4 || mergingPages.some(p => p.canvas.width !== mergingPages[0].canvas.width)) {
-        const newPage = new AtlasPage(this._document, this._textureSize);
-        this._pages.push(newPage);
-        this._activePages.push(newPage);
-        this._onAddTextureAtlasCanvas.fire(newPage.canvas);
-        return newPage;
-      }
-
-      const sortedMergingPagesIndexes = mergingPages.map(e => e.glyphs[0].texturePage).sort((a, b) => a > b ? 1 : -1);
-      const mergedPageIndex = this.pages.length - mergingPages.length;
-
-      // Merge into the new page
-      const mergedPage = this._mergePages(mergingPages, mergedPageIndex);
-      mergedPage.version++;
-
-      // Delete the pages, shifting glyph texture pages as needed
-      for (let i = sortedMergingPagesIndexes.length - 1; i >= 0; i--) {
-        this._deletePage(sortedMergingPagesIndexes[i]);
-      }
-
-      // Add the new merged page to the end
-      this.pages.push(mergedPage);
-
-      // Request the model to be cleared to refresh all texture pages.
-      this._requestClearModel = true;
-      this._onAddTextureAtlasCanvas.fire(mergedPage.canvas);
+    if (TextureAtlas.maxAtlasPages && this._pages.length >= TextureAtlas.maxAtlasPages) {
+      return this._evictLruPage();
     }
-
-    // All new atlas pages are created small as they are highly dynamic
     const newPage = new AtlasPage(this._document, this._textureSize);
     this._pages.push(newPage);
     this._activePages.push(newPage);
@@ -216,69 +179,98 @@ export class TextureAtlas implements ITextureAtlas {
     return newPage;
   }
 
-  private _mergePages(mergingPages: AtlasPage[], mergedPageIndex: number): AtlasPage {
-    const mergedSize = mergingPages[0].canvas.width * 2;
-    const mergedPage = new AtlasPage(this._document, mergedSize, mergingPages);
-    for (const [i, p] of mergingPages.entries()) {
-      const xOffset = i * p.canvas.width % mergedSize;
-      const yOffset = Math.floor(i / 2) * p.canvas.height;
-      mergedPage.ctx.drawImage(p.canvas, xOffset, yOffset);
-      for (const g of p.glyphs) {
-        g.texturePage = mergedPageIndex;
-        g.sizeClipSpace.x = g.size.x / mergedSize;
-        g.sizeClipSpace.y = g.size.y / mergedSize;
-        g.texturePosition.x += xOffset;
-        g.texturePosition.y += yOffset;
-        g.texturePositionClipSpace.x = g.texturePosition.x / mergedSize;
-        g.texturePositionClipSpace.y = g.texturePosition.y / mergedSize;
-      }
-
-      this._onRemoveTextureAtlasCanvas.fire(p.canvas);
-
-      // Remove the merging page from active pages if it was there
-      const index = this._activePages.indexOf(p);
-      if (index !== -1) {
-        this._activePages.splice(index, 1);
+  private _evictLruPage(): AtlasPage {
+    let victim = this._pages[0];
+    for (let i = 1; i < this._pages.length; i++) {
+      if (this._pages[i].lastFrame < victim.lastFrame) {
+        victim = this._pages[i];
       }
     }
-    return mergedPage;
-  }
-
-  private _deletePage(pageIndex: number): void {
-    this._pages.splice(pageIndex, 1);
-    for (let j = pageIndex; j < this._pages.length; j++) {
-      const adjustingPage = this._pages[j];
-      for (const g of adjustingPage.glyphs) {
-        g.texturePage--;
-      }
-      adjustingPage.version++;
+    victim.evict();
+    if (this._activePages.indexOf(victim) === -1) {
+      this._activePages.push(victim);
     }
+    this._requestClearModel = true;
+    return victim;
   }
 
-  public getRasterizedGlyphCombinedChar(chars: string, bg: number, fg: number, ext: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph {
-    return this._getFromCacheMap(this._cacheMapCombined, chars, bg, fg, ext, restrictToCellHeight, domContainer);
+  public getRasterizedGlyphCombinedChar(chars: string, styleFlags: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph {
+    return this._getFromCacheMap(this._cacheMapCombined, chars, styleFlags, restrictToCellHeight, domContainer);
   }
 
-  public getRasterizedGlyph(code: number, bg: number, fg: number, ext: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph {
-    return this._getFromCacheMap(this._cacheMap, code, bg, fg, ext, restrictToCellHeight, domContainer);
+  public getRasterizedGlyph(code: number, styleFlags: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph {
+    return this._getFromCacheMap(this._cacheMap, code, styleFlags, restrictToCellHeight, domContainer);
   }
 
-  /**
-   * Gets the glyphs texture coords, drawing the texture if it's not already
-   */
+  // Packs the cell's style attributes (fg flag bits + ext underline style/variant) into the
+  // single number used as the alpha-only atlas's cache key.
+  public extractStyleFlags(fg: number, ext: number): number {
+    this._workAttributeData.fg = fg;
+    this._workAttributeData.bg = 0;
+    this._workAttributeData.extended.ext = ext;
+    let flags = 0;
+    if (this._workAttributeData.isBold()) flags |= StyleFlags.BOLD;
+    if (this._workAttributeData.isItalic()) flags |= StyleFlags.ITALIC;
+    if (this._workAttributeData.isStrikethrough()) flags |= StyleFlags.STRIKETHROUGH;
+    if (this._workAttributeData.isOverline()) flags |= StyleFlags.OVERLINE;
+    if (this._workAttributeData.isUnderline()) {
+      flags |= StyleFlags.UNDERLINE;
+      flags |= (this._workAttributeData.extended.underlineStyle & 0x7) << StyleFlags.UNDERLINE_STYLE_SHIFT;
+      flags |= (this._workAttributeData.getUnderlineVariantOffset() & 0x3f) << StyleFlags.VARIANT_OFFSET_SHIFT;
+    }
+    return flags;
+  }
+
+  // Resolves the per-cell foreground color into normalized RGBA, applying inverse,
+  // dim and minimumContrastRatio adjustments. Returns true if the cell should not
+  // render a glyph (the INVISIBLE flag was set, e.g. blinking text in its off phase).
+  public resolveFgRgba(bg: number, fg: number, ext: number, charCode: number, dst: Float32Array, dstOffset: number): boolean {
+    this._workAttributeData.fg = fg;
+    this._workAttributeData.bg = bg;
+    this._workAttributeData.extended.ext = ext;
+    if (this._workAttributeData.isInvisible()) {
+      return true;
+    }
+    const bold = !!this._workAttributeData.isBold();
+    const inverse = !!this._workAttributeData.isInverse();
+    const dim = !!this._workAttributeData.isDim();
+    let fgColor = this._workAttributeData.getFgColor();
+    let fgColorMode = this._workAttributeData.getFgColorMode();
+    let bgColor = this._workAttributeData.getBgColor();
+    let bgColorMode = this._workAttributeData.getBgColorMode();
+    if (inverse) {
+      const temp = fgColor; fgColor = bgColor; bgColor = temp;
+      const temp2 = fgColorMode; fgColorMode = bgColorMode; bgColorMode = temp2;
+    }
+    const color = this._getForegroundColor(bg, bgColorMode, bgColor, fg, fgColorMode, fgColor, inverse, dim, bold, treatGlyphAsBackgroundColor(charCode));
+    dst[dstOffset    ] = ((color.rgba >>> 24) & 0xFF) / 255;
+    dst[dstOffset + 1] = ((color.rgba >>> 16) & 0xFF) / 255;
+    dst[dstOffset + 2] = ((color.rgba >>> 8) & 0xFF) / 255;
+    dst[dstOffset + 3] = (color.rgba & 0xFF) / 255;
+    return false;
+  }
+
   private _getFromCacheMap(
-    cacheMap: FourKeyMap<string | number, number, number, number, IRasterizedGlyph>,
+    cacheMap: TwoKeyMap<string | number, number, IRasterizedGlyph>,
     key: string | number,
-    bg: number,
-    fg: number,
-    ext: number,
+    styleFlags: number,
     restrictToCellHeight: boolean,
     domContainer: HTMLElement | undefined
   ): IRasterizedGlyph {
-    $glyph = cacheMap.get(key, bg, fg, ext);
+    $glyph = cacheMap.get(key, styleFlags);
     if (!$glyph) {
-      $glyph = this._drawToCache(key, bg, fg, ext, restrictToCellHeight, domContainer);
-      cacheMap.set(key, bg, fg, ext, $glyph);
+      $glyph = this._drawToCache(key, styleFlags, restrictToCellHeight, domContainer);
+      if ($glyph !== NULL_RASTERIZED_GLYPH) {
+        cacheMap.set(key, styleFlags, $glyph);
+        $glyph.removeFromCache = () => cacheMap.delete(key, styleFlags);
+      }
+    }
+    if ($glyph !== NULL_RASTERIZED_GLYPH) {
+      $glyph.lastFrame = this._currentFrame;
+      const page = this._pages[$glyph.texturePage];
+      if (page) {
+        page.lastFrame = this._currentFrame;
+      }
     }
     return $glyph;
   }
@@ -288,42 +280,6 @@ export class TextureAtlas implements ITextureAtlas {
       throw new Error('No color found for idx ' + idx);
     }
     return this._config.colors.ansi[idx];
-  }
-
-  private _getBackgroundColor(bgColorMode: number, bgColor: number, inverse: boolean, dim: boolean): IColor {
-    if (this._config.allowTransparency) {
-      // The background color might have some transparency, so we need to render it as fully
-      // transparent in the atlas. Otherwise we'd end up drawing the transparent background twice
-      // around the anti-aliased edges of the glyph, and it would look too dark.
-      return NULL_COLOR;
-    }
-
-    let result: IColor;
-    switch (bgColorMode) {
-      case Attributes.CM_P16:
-      case Attributes.CM_P256:
-        result = this._getColorFromAnsiIndex(bgColor);
-        break;
-      case Attributes.CM_RGB:
-        const arr = AttributeData.toColorRGB(bgColor);
-        result = channels.toColor(arr[0], arr[1], arr[2]);
-        break;
-      case Attributes.CM_DEFAULT:
-      default:
-        if (inverse) {
-          result = color.opaque(this._config.colors.foreground);
-        } else {
-          result = this._config.colors.background;
-        }
-        break;
-    }
-
-    // Ignore alpha channel when allowTransparency is false
-    if (!this._config.allowTransparency) {
-      result = color.opaque(result);
-    }
-
-    return result;
   }
 
   private _getForegroundColor(bg: number, bgColorMode: number, bgColor: number, fg: number, fgColorMode: number, fgColor: number, inverse: boolean, dim: boolean, bold: boolean, excludeFromContrastRatioDemands: boolean): IColor {
@@ -442,98 +398,53 @@ export class TextureAtlas implements ITextureAtlas {
     return this._config.colors.contrastCache;
   }
 
-  private _drawToCache(codeOrChars: number | string, bg: number, fg: number, ext: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph {
+  private _drawToCache(codeOrChars: number | string, styleFlags: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph {
     const chars = typeof codeOrChars === 'number' ? String.fromCharCode(codeOrChars) : codeOrChars;
 
-    // Uncomment for debugging
-    // console.log(`draw to cache "${chars}"`, bg, fg, ext);
-
-    // Attach the canvas to the DOM in order to inherit font-feature-settings
-    // from the parent elements. This is necessary for ligatures and variants to
-    // work.
     if (domContainer && this._tmpCanvas.parentElement !== domContainer) {
       this._tmpCanvas.style.display = 'none';
       domContainer.append(this._tmpCanvas);
     }
 
-    // Allow 1 cell width per character, with a minimum of 2 (CJK), plus some padding. This is used
-    // to draw the glyph to the canvas as well as to restrict the bounding box search to ensure
-    // giant ligatures (eg. =====>) don't impact overall performance.
     const allowedWidth = Math.min(this._config.deviceCellWidth * Math.max(chars.length, 2) + TMP_CANVAS_GLYPH_PADDING * 2, this._config.deviceMaxTextureSize);
     if (this._tmpCanvas.width < allowedWidth) {
       this._tmpCanvas.width = allowedWidth;
     }
-    // Include line height when drawing glyphs
     const allowedHeight = Math.min(this._config.deviceCellHeight + TMP_CANVAS_GLYPH_PADDING * 4, this._textureSize);
     if (this._tmpCanvas.height < allowedHeight) {
       this._tmpCanvas.height = allowedHeight;
     }
+
+    const bold = (styleFlags & StyleFlags.BOLD) !== 0;
+    const italic = (styleFlags & StyleFlags.ITALIC) !== 0;
+    const underline = (styleFlags & StyleFlags.UNDERLINE) !== 0;
+    const strikethrough = (styleFlags & StyleFlags.STRIKETHROUGH) !== 0;
+    const overline = (styleFlags & StyleFlags.OVERLINE) !== 0;
+    const underlineStyle = (styleFlags & StyleFlags.UNDERLINE_STYLE_MASK) >>> StyleFlags.UNDERLINE_STYLE_SHIFT;
+    const variantOffset = (styleFlags & StyleFlags.VARIANT_OFFSET_MASK) >>> StyleFlags.VARIANT_OFFSET_SHIFT;
+
     this._tmpCtx.save();
+    this._tmpCtx.clearRect(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
 
-    this._workAttributeData.fg = fg;
-    this._workAttributeData.bg = bg;
-    this._workAttributeData.extended.ext = ext;
-
-    const invisible = !!this._workAttributeData.isInvisible();
-    if (invisible) {
-      return NULL_RASTERIZED_GLYPH;
-    }
-
-    const bold = !!this._workAttributeData.isBold();
-    const inverse = !!this._workAttributeData.isInverse();
-    const dim = !!this._workAttributeData.isDim();
-    const italic = !!this._workAttributeData.isItalic();
-    const underline = !!this._workAttributeData.isUnderline();
-    const strikethrough = !!this._workAttributeData.isStrikethrough();
-    const overline = !!this._workAttributeData.isOverline();
-    let fgColor = this._workAttributeData.getFgColor();
-    let fgColorMode = this._workAttributeData.getFgColorMode();
-    let bgColor = this._workAttributeData.getBgColor();
-    let bgColorMode = this._workAttributeData.getBgColorMode();
-    if (inverse) {
-      const temp = fgColor;
-      fgColor = bgColor;
-      bgColor = temp;
-      const temp2 = fgColorMode;
-      fgColorMode = bgColorMode;
-      bgColorMode = temp2;
-    }
-
-    // draw the background
-    const backgroundColor = this._getBackgroundColor(bgColorMode, bgColor, inverse, dim);
-    // Use a 'copy' composite operation to clear any existing glyph out of _tmpCtxWithAlpha,
-    // regardless of transparency in backgroundColor
-    this._tmpCtx.globalCompositeOperation = 'copy';
-    this._tmpCtx.fillStyle = backgroundColor.css;
-    this._tmpCtx.fillRect(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
-    this._tmpCtx.globalCompositeOperation = 'source-over';
-
-    // draw the foreground/glyph
     const fontWeight = bold ? this._config.fontWeightBold : this._config.fontWeight;
     const fontStyle = italic ? 'italic' : '';
     this._tmpCtx.font =
       `${fontStyle} ${fontWeight} ${this._config.fontSize * this._config.devicePixelRatio}px ${this._config.fontFamily}`;
     this._tmpCtx.textBaseline = TEXT_BASELINE;
 
-    const powerlineGlyph = chars.length === 1 && isPowerlineGlyph(chars.charCodeAt(0));
     const restrictedPowerlineGlyph = chars.length === 1 && isRestrictedPowerlineGlyph(chars.charCodeAt(0));
-    const foregroundColor = this._getForegroundColor(bg, bgColorMode, bgColor, fg, fgColorMode, fgColor, inverse, dim, bold, treatGlyphAsBackgroundColor(chars.charCodeAt(0)));
-    this._tmpCtx.fillStyle = foregroundColor.css;
 
-    // For powerline glyphs left/top padding is excluded (https://github.com/microsoft/vscode/issues/120129)
+    // Alpha-only rasterization: glyph drawn in white on a transparent canvas. The fragment
+    // shader tints by the per-cell fg color at draw time, so the same atlas entry serves any
+    // fg/bg combination — eliminating the cache-key explosion that drives atlas thrash.
+    this._tmpCtx.fillStyle = '#ffffff';
+
     const padding = restrictedPowerlineGlyph ? 0 : TMP_CANVAS_GLYPH_PADDING * 2;
 
-    // Draw custom characters if applicable
     let customGlyph = false;
     if (this._config.customGlyphs !== false) {
-      const variantOffset = this._workAttributeData.getUnderlineVariantOffset();
-      customGlyph = tryDrawCustomGlyph(this._tmpCtx, chars, padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight, this._config.deviceCharWidth, this._config.deviceCharHeight, this._config.fontSize, this._config.devicePixelRatio, backgroundColor.css, variantOffset);
+      customGlyph = tryDrawCustomGlyph(this._tmpCtx, chars, padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight, this._config.deviceCharWidth, this._config.deviceCharHeight, this._config.fontSize, this._config.devicePixelRatio, undefined, variantOffset);
     }
-
-    // Whether to clear pixels based on a threshold difference between the glyph color and the
-    // background color. This should be disabled when the glyph contains multiple colors such as
-    // underline colors to prevent important colors could get cleared.
-    let enableClearThresholdCheck = !powerlineGlyph;
 
     let chWidth: number;
     if (typeof codeOrChars === 'number') {
@@ -542,74 +453,47 @@ export class TextureAtlas implements ITextureAtlas {
       chWidth = this._unicodeService.getStringCellWidth(codeOrChars);
     }
 
-    // Draw underline
     if (underline) {
       this._tmpCtx.save();
       const lineWidth = Math.max(1, Math.floor(this._config.fontSize * this._config.devicePixelRatio / 15));
-      // When the line width is odd, draw at a 0.5 position
       const yOffset = lineWidth % 2 === 1 ? 0.5 : 0;
       this._tmpCtx.lineWidth = lineWidth;
+      this._tmpCtx.strokeStyle = '#ffffff';
+      this._tmpCtx.fillStyle = '#ffffff';
 
-      // Underline color
-      if (this._workAttributeData.isUnderlineColorDefault()) {
-        this._tmpCtx.strokeStyle = this._tmpCtx.fillStyle;
-      } else if (this._workAttributeData.isUnderlineColorRGB()) {
-        enableClearThresholdCheck = false;
-        this._tmpCtx.strokeStyle = `rgb(${AttributeData.toColorRGB(this._workAttributeData.getUnderlineColor()).join(',')})`;
-      } else {
-        enableClearThresholdCheck = false;
-        let fg = this._workAttributeData.getUnderlineColor();
-        if (this._config.drawBoldTextInBrightColors && this._workAttributeData.isBold() && fg < 8) {
-          fg += 8;
-        }
-        this._tmpCtx.strokeStyle = this._getColorFromAnsiIndex(fg).css;
-      }
-      this._tmpCtx.fillStyle = this._tmpCtx.strokeStyle;
-
-      // Underline style/stroke
       this._tmpCtx.beginPath();
       const xLeft = padding;
       const yTopDefault = Math.ceil(padding + this._config.deviceCharHeight) - yOffset - (restrictToCellHeight ? lineWidth * 2 : 0);
       const yBotDefault = yTopDefault + lineWidth * 2;
-      let nextOffset = this._workAttributeData.getUnderlineVariantOffset();
-      let yTop = 0;
-      let yBot = 0;
+      let nextOffset = variantOffset;
 
       for (let i = 0; i < chWidth; i++) {
         let wasFilled = false;
         this._tmpCtx.save();
-        yTop = yTopDefault;
-        yBot = yBotDefault;
         const xChLeft = xLeft + i * this._config.deviceCellWidth;
         const xChRight = xLeft + (i + 1) * this._config.deviceCellWidth;
-        switch (this._workAttributeData.extended.underlineStyle) {
+        switch (underlineStyle) {
           case UnderlineStyle.DOUBLE:
             this._tmpCtx.moveTo(xChLeft, yTopDefault);
             this._tmpCtx.lineTo(xChRight, yTopDefault);
             this._tmpCtx.moveTo(xChLeft, yBotDefault);
             this._tmpCtx.lineTo(xChRight, yBotDefault);
             break;
-          case UnderlineStyle.CURLY:
-            yTop = this._config.deviceCharHeight + 1;
-            yBot = yTop + 3 * this._config.devicePixelRatio;
-
+          case UnderlineStyle.CURLY: {
+            const yTop = this._config.deviceCharHeight + 1;
+            const yBot = yTop + 3 * this._config.devicePixelRatio;
             const clipRegion = new Path2D();
             clipRegion.rect(xChLeft, yTop, this._config.deviceCellWidth, yBot - yTop);
             this._tmpCtx.clip(clipRegion);
-
-            // Draw a zigzag pattern, this is derived from the SVG used in monaco for the same
-            // style. The viewbox is 6x3 so scale it using that.
             const cellW = this._config.deviceCellWidth;
             const curlyH = (yBot - yTop);
             const scaleX = cellW / 6;
             const scaleY = curlyH / 3;
-
             const polygons: number[][] = [
               [0, 2, 1, 3, 2.4, 3, 0, 0.6],
               [5.5, 0, 2.5, 3, 1.1, 3, 4.1, 0],
-              [4, 0, 6, 2, 6, 0.6, 5.4, 0],
+              [4, 0, 6, 2, 6, 0.6, 5.4, 0]
             ];
-
             for (const polygon of polygons) {
               this._tmpCtx.beginPath();
               for (let i = 0; i < polygon.length; i += 2) {
@@ -626,10 +510,10 @@ export class TextureAtlas implements ITextureAtlas {
             }
             wasFilled = true;
             break;
-          case UnderlineStyle.DOTTED:
+          }
+          case UnderlineStyle.DOTTED: {
             const offsetWidth = nextOffset === 0 ? 0 :
               (nextOffset >= lineWidth ? lineWidth * 2 - nextOffset : lineWidth - nextOffset);
-              // a line and a gap.
             const isLineStart = nextOffset >= lineWidth ? false : true;
             if (isLineStart === false || offsetWidth === 0) {
               this._tmpCtx.setLineDash([Math.round(lineWidth), Math.round(lineWidth)]);
@@ -644,10 +528,10 @@ export class TextureAtlas implements ITextureAtlas {
             }
             nextOffset = computeNextVariantOffset(xChRight - xChLeft, lineWidth, nextOffset);
             break;
-          case UnderlineStyle.DASHED:
+          }
+          case UnderlineStyle.DASHED: {
             const lineRatio = 0.6;
             const gapRatio = 0.3;
-            // End line ratio is approximately equal to 0.1
             const xChWidth = xChRight - xChLeft;
             const line = Math.floor(lineRatio * xChWidth);
             const gap = Math.floor(gapRatio * xChWidth);
@@ -656,6 +540,7 @@ export class TextureAtlas implements ITextureAtlas {
             this._tmpCtx.moveTo(xChLeft, yTopDefault);
             this._tmpCtx.lineTo(xChRight, yTopDefault);
             break;
+          }
           case UnderlineStyle.SINGLE:
           default:
             this._tmpCtx.moveTo(xChLeft, yTopDefault);
@@ -668,80 +553,43 @@ export class TextureAtlas implements ITextureAtlas {
         this._tmpCtx.restore();
       }
       this._tmpCtx.restore();
-
-      // Draw stroke in the background color for non custom characters in order to give an outline
-      // between the text and the underline. Only do this when font size is >= 12 as the underline
-      // looks odd when the font size is too small
-      if (!customGlyph && this._config.fontSize >= 12) {
-        // This only works when transparency is disabled because it's not clear how to clear stroked
-        // text
-        if (!this._config.allowTransparency && chars !== ' ') {
-          // Measure the text, only draw the stroke if there is a descent beyond an alphabetic text
-          // baseline
-          this._tmpCtx.save();
-          this._tmpCtx.textBaseline = 'alphabetic';
-          const metrics = this._tmpCtx.measureText(chars);
-          this._tmpCtx.restore();
-          if ('actualBoundingBoxDescent' in metrics && metrics.actualBoundingBoxDescent > 0) {
-            // This translates to 1/2 the line width in either direction
-            this._tmpCtx.save();
-            // Clip the region to only draw in valid pixels near the underline to avoid a slight
-            // outline around the whole glyph, as well as additional pixels in the glyph at the top
-            // which would increase GPU memory demands
-            const clipRegion = new Path2D();
-            clipRegion.rect(xLeft, yTop - Math.ceil(lineWidth / 2), this._config.deviceCellWidth * chWidth, yBot - yTop + Math.ceil(lineWidth / 2));
-            this._tmpCtx.clip(clipRegion);
-            this._tmpCtx.lineWidth = this._config.devicePixelRatio * 3;
-            this._tmpCtx.strokeStyle = backgroundColor.css;
-            this._tmpCtx.strokeText(chars, padding, padding + this._config.deviceCharHeight);
-            this._tmpCtx.restore();
-          }
-        }
-      }
     }
 
-    // Overline
     if (overline) {
       const lineWidth = Math.max(1, Math.floor(this._config.fontSize * this._config.devicePixelRatio / 15));
       const yOffset = lineWidth % 2 === 1 ? 0.5 : 0;
       this._tmpCtx.lineWidth = lineWidth;
-      this._tmpCtx.strokeStyle = this._tmpCtx.fillStyle;
+      this._tmpCtx.strokeStyle = '#ffffff';
       this._tmpCtx.beginPath();
       this._tmpCtx.moveTo(padding, padding + yOffset);
       this._tmpCtx.lineTo(padding + this._config.deviceCharWidth * chWidth, padding + yOffset);
       this._tmpCtx.stroke();
     }
 
-    // Draw the character
     if (!customGlyph) {
       this._tmpCtx.fillText(chars, padding, padding + this._config.deviceCharHeight);
     }
 
-    // If this character is underscore and beyond the cell bounds, shift it up until it is visible
-    // even on the bottom row, try for a maximum of 5 pixels.
-    if (chars === '_' && !this._config.allowTransparency) {
-      let isBeyondCellBounds = clearColor(this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight), backgroundColor, foregroundColor, enableClearThresholdCheck);
-      if (isBeyondCellBounds) {
+    // Shift underscore up if it falls outside the cell.
+    if (chars === '_') {
+      let cellPixels = this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight);
+      if (checkCompletelyTransparent(cellPixels)) {
         for (let offset = 1; offset <= 5; offset++) {
-          this._tmpCtx.save();
-          this._tmpCtx.fillStyle = backgroundColor.css;
-          this._tmpCtx.fillRect(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
-          this._tmpCtx.restore();
+          this._tmpCtx.clearRect(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
           this._tmpCtx.fillText(chars, padding, padding + this._config.deviceCharHeight - offset);
-          isBeyondCellBounds = clearColor(this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight), backgroundColor, foregroundColor, enableClearThresholdCheck);
-          if (!isBeyondCellBounds) {
+          cellPixels = this._tmpCtx.getImageData(padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight);
+          if (!checkCompletelyTransparent(cellPixels)) {
             break;
           }
         }
       }
     }
 
-    // Draw strokethrough
     if (strikethrough) {
       const lineWidth = Math.max(1, Math.floor(this._config.fontSize * this._config.devicePixelRatio / 10));
-      const yOffset = this._tmpCtx.lineWidth % 2 === 1 ? 0.5 : 0; // When the width is odd, draw at 0.5 position
+      const yOffset = this._tmpCtx.lineWidth % 2 === 1 ? 0.5 : 0;
       this._tmpCtx.lineWidth = lineWidth;
-      this._tmpCtx.strokeStyle = this._tmpCtx.fillStyle;
+      this._tmpCtx.strokeStyle = '#ffffff';
       this._tmpCtx.beginPath();
       this._tmpCtx.moveTo(padding, padding + Math.floor(this._config.deviceCharHeight / 2) - yOffset);
       this._tmpCtx.lineTo(padding + this._config.deviceCharWidth * chWidth, padding + Math.floor(this._config.deviceCharHeight / 2) - yOffset);
@@ -750,26 +598,27 @@ export class TextureAtlas implements ITextureAtlas {
 
     this._tmpCtx.restore();
 
-    // clear the background from the character to avoid issues with drawing over the previous
-    // character if it extends past it's bounds
-    const imageData = this._tmpCtx.getImageData(
-      0, 0, this._tmpCanvas.width, this._tmpCanvas.height
-    );
+    const imageData = this._tmpCtx.getImageData(0, 0, this._tmpCanvas.width, this._tmpCanvas.height);
 
-    // Clear out the background color and determine if the glyph is empty.
-    let isEmpty: boolean;
-    if (!this._config.allowTransparency) {
-      isEmpty = clearColor(imageData, backgroundColor, foregroundColor, enableClearThresholdCheck);
-    } else {
-      isEmpty = checkCompletelyTransparent(imageData);
-    }
-
-    // Handle empty glyphs
-    if (isEmpty) {
+    if (checkCompletelyTransparent(imageData)) {
       return NULL_RASTERIZED_GLYPH;
     }
 
+    // Detect non-grayscale pixels (e.g. color emoji) so the shader can sample directly
+    // instead of tinting.
+    let isColored = false;
+    for (let i = 0; i < imageData.data.length; i += 4) {
+      if (imageData.data[i + 3] === 0) {
+        continue;
+      }
+      if (imageData.data[i] !== imageData.data[i + 1] || imageData.data[i + 1] !== imageData.data[i + 2]) {
+        isColored = true;
+        break;
+      }
+    }
+
     const rasterizedGlyph = this._findGlyphBoundingBox(imageData, this._workBoundingBox, allowedWidth, restrictedPowerlineGlyph, customGlyph, padding);
+    rasterizedGlyph.isColored = isColored;
 
     // Find the best atlas row to use
     let activePage: AtlasPage;
@@ -937,7 +786,7 @@ export class TextureAtlas implements ITextureAtlas {
       rasterizedGlyph.size.y
     );
     activePage.addGlyph(rasterizedGlyph);
-    activePage.version++;
+    activePage.version = ++AtlasPage.nextVersion;
 
     return rasterizedGlyph;
   }
@@ -1027,7 +876,9 @@ export class TextureAtlas implements ITextureAtlas {
       offset: {
         x: -boundingBox.left + padding + ((restrictedGlyph || customGlyph) ? Math.floor((this._config.deviceCellWidth - this._config.deviceCharWidth) / 2) : 0),
         y: -boundingBox.top + padding + ((restrictedGlyph || customGlyph) ? this._config.lineHeight === 1 ? 0 : Math.round((this._config.deviceCellHeight - this._config.deviceCharHeight) / 2) : 0)
-      }
+      },
+      lastFrame: 0,
+      isColored: false
     };
   }
 }
@@ -1047,9 +898,16 @@ class AtlasPage {
   }
 
   /**
-   * Used to check whether the canvas of the atlas page has changed.
+   * Frame counter of the most recent glyph access on this page; used for LRU eviction.
    */
-  public version = 0;
+  public lastFrame: number = 0;
+
+  /**
+   * Globally monotonic so the GPU-side version check cannot collide across page identity
+   * changes (a freshly-evicted page reused at the same index gets a fresh value).
+   */
+  public static nextVersion: number = 0;
+  public version: number = ++AtlasPage.nextVersion;
 
   // Texture atlas current positioning data. The texture packing strategy used is to fill from
   // left-to-right and top-to-bottom. When the glyph being written is less than half of the current
@@ -1070,19 +928,9 @@ class AtlasPage {
 
   constructor(
     document: Document,
-    size: number,
-    sourcePages?: AtlasPage[]
+    size: number
   ) {
-    if (sourcePages) {
-      for (const p of sourcePages) {
-        this._glyphs.push(...p.glyphs);
-        this._usedPixels += p._usedPixels;
-      }
-    }
     this.canvas = createCanvas(document, size, size);
-    // The canvas needs alpha because we use clearColor to convert the background color to alpha.
-    // It might also contain some characters with transparent backgrounds if allowTransparency is
-    // set.
     this.ctx = throwIfFalsy(this.canvas.getContext('2d', { alpha: true }));
   }
 
@@ -1092,54 +940,18 @@ class AtlasPage {
     this.currentRow.y = 0;
     this.currentRow.height = 0;
     this.fixedRows.length = 0;
-    this.version++;
+    this.version = ++AtlasPage.nextVersion;
   }
-}
 
-/**
- * Makes a particular rgb color and colors that are nearly the same in an ImageData completely
- * transparent.
- * @returns True if the result is "empty", meaning all pixels are fully transparent.
- */
-function clearColor(imageData: ImageData, bg: IColor, fg: IColor, enableThresholdCheck: boolean): boolean {
-  // Get color channels
-  const r = bg.rgba >>> 24;
-  const g = bg.rgba >>> 16 & 0xFF;
-  const b = bg.rgba >>> 8 & 0xFF;
-  const fgR = fg.rgba >>> 24;
-  const fgG = fg.rgba >>> 16 & 0xFF;
-  const fgB = fg.rgba >>> 8 & 0xFF;
-
-  // Calculate a threshold that when below a color will be treated as transpart when the sum of
-  // channel value differs. This helps improve rendering when glyphs overlap with others. This
-  // threshold is calculated relative to the difference between the background and foreground to
-  // ensure important details of the glyph are always shown, even when the contrast ratio is low.
-  // The number 12 is largely arbitrary to ensure the pixels that escape the cell in the test case
-  // were covered (fg=#8ae234, bg=#c4a000).
-  const threshold = Math.floor((Math.abs(r - fgR) + Math.abs(g - fgG) + Math.abs(b - fgB)) / 12);
-
-  // Set alpha channel of relevent pixels to 0
-  let isEmpty = true;
-  for (let offset = 0; offset < imageData.data.length; offset += 4) {
-    // Check exact match
-    if (imageData.data[offset] === r &&
-        imageData.data[offset + 1] === g &&
-        imageData.data[offset + 2] === b) {
-      imageData.data[offset + 3] = 0;
-    } else {
-      // Check the threshold based difference
-      if (enableThresholdCheck &&
-          (Math.abs(imageData.data[offset] - r) +
-          Math.abs(imageData.data[offset + 1] - g) +
-          Math.abs(imageData.data[offset + 2] - b)) < threshold) {
-        imageData.data[offset + 3] = 0;
-      } else {
-        isEmpty = false;
-      }
+  public evict(): void {
+    for (const g of this._glyphs) {
+      g.removeFromCache?.();
     }
+    this._glyphs.length = 0;
+    this._usedPixels = 0;
+    this.lastFrame = 0;
+    this.clear();
   }
-
-  return isEmpty;
 }
 
 function checkCompletelyTransparent(imageData: ImageData): boolean {
