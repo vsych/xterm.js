@@ -80,7 +80,6 @@ export class TextureAtlas implements ITextureAtlas {
 
   // The set of atlas pages that can be written to
   private _activePages: AtlasPage[] = [];
-  private _overflowSizePage: AtlasPage | undefined;
 
   private _tmpCanvas: HTMLCanvasElement;
   // A temporary context that glyphs are drawn to before being transfered to the atlas.
@@ -89,7 +88,7 @@ export class TextureAtlas implements ITextureAtlas {
   private _workBoundingBox: IBoundingBox = { top: 0, left: 0, bottom: 0, right: 0 };
   private _workAttributeData: AttributeData = new AttributeData();
 
-  private _textureSize: number = 1024;
+  public static readonly atlasPageSize: number = 1024;
 
   public static maxAtlasPages: number | undefined;
   public static maxTextureSize: number | undefined;
@@ -172,7 +171,7 @@ export class TextureAtlas implements ITextureAtlas {
     if (TextureAtlas.maxAtlasPages && this._pages.length >= TextureAtlas.maxAtlasPages) {
       return this._evictLruPage();
     }
-    const newPage = new AtlasPage(this._document, this._textureSize);
+    const newPage = new AtlasPage(this._document, TextureAtlas.atlasPageSize);
     this._pages.push(newPage);
     this._activePages.push(newPage);
     this._onAddTextureAtlasCanvas.fire(newPage.canvas);
@@ -406,11 +405,11 @@ export class TextureAtlas implements ITextureAtlas {
       domContainer.append(this._tmpCanvas);
     }
 
-    const allowedWidth = Math.min(this._config.deviceCellWidth * Math.max(chars.length, 2) + TMP_CANVAS_GLYPH_PADDING * 2, this._config.deviceMaxTextureSize);
+    const allowedWidth = Math.min(this._config.deviceCellWidth * Math.max(chars.length, 2) + TMP_CANVAS_GLYPH_PADDING * 2, TextureAtlas.atlasPageSize);
     if (this._tmpCanvas.width < allowedWidth) {
       this._tmpCanvas.width = allowedWidth;
     }
-    const allowedHeight = Math.min(this._config.deviceCellHeight + TMP_CANVAS_GLYPH_PADDING * 4, this._textureSize);
+    const allowedHeight = Math.min(this._config.deviceCellHeight + TMP_CANVAS_GLYPH_PADDING * 4, TextureAtlas.atlasPageSize);
     if (this._tmpCanvas.height < allowedHeight) {
       this._tmpCanvas.height = allowedHeight;
     }
@@ -658,26 +657,6 @@ export class TextureAtlas implements ITextureAtlas {
         }
       }
 
-      // Create a new page for oversized glyphs as they come up
-      if (rasterizedGlyph.size.x > this._textureSize) {
-        if (!this._overflowSizePage) {
-          this._overflowSizePage = new AtlasPage(this._document, this._config.deviceMaxTextureSize);
-          this.pages.push(this._overflowSizePage);
-
-          // Request the model to be cleared to refresh all texture pages.
-          this._requestClearModel = true;
-          this._onAddTextureAtlasCanvas.fire(this._overflowSizePage.canvas);
-        }
-        activePage = this._overflowSizePage;
-        activeRow = this._overflowSizePage.currentRow;
-        // Move to next row if necessary
-        if (activeRow.x + rasterizedGlyph.size.x >= activePage.canvas.width) {
-          activeRow.x = 0;
-          activeRow.y += activeRow.height;
-          activeRow.height = 0;
-        }
-        break;
-      }
 
       // Create a new page if too much vertical space would be wasted or there is not enough room
       // left in the page. The previous active row will become fixed in the process as it now has a

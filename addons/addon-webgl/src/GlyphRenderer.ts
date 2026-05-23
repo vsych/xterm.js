@@ -8,7 +8,7 @@ import { NULL_CELL_CODE } from 'common/buffer/Constants';
 import { Disposable, toDisposable } from 'common/Lifecycle';
 import { Terminal } from '@xterm/xterm';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject, type IRasterizedGlyph, type ITextureAtlas } from './Types';
-import { createProgram, GLTexture, PROJECTION_MATRIX } from './WebglUtils';
+import { createProgram, PROJECTION_MATRIX } from './WebglUtils';
 import type { IOptionsService } from 'common/services/Services';
 import { allowRescaling, throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
 
@@ -60,35 +60,27 @@ void main() {
   v_fgcolor = a_fgcolor;
 }`;
 
-// The atlas stores monochrome glyphs in white on a transparent canvas; the fragment
-// shader tints them by v_fgcolor at draw time. A negative v_fgcolor.a is the sentinel
-// for "this glyph is colored (e.g. emoji); sample the texture directly without tinting".
-function createFragmentShaderSource(maxFragmentShaderTextureUnits: number): string {
-  let sampleBranches = '';
-  for (let i = 1; i < maxFragmentShaderTextureUnits; i++) {
-    sampleBranches += ` else if (v_texpage == ${i}) { sampled = texture(u_texture[${i}], v_texcoord); }`;
-  }
-  return (`#version 300 es
+// The atlas is a single Texture2DArray where each layer is one atlas page. The fragment
+// shader tints monochrome glyphs by v_fgcolor; a negative v_fgcolor.a means "this glyph
+// is colored (e.g. emoji), sample the texture directly without tinting".
+const fragmentShaderSource = `#version 300 es
 precision lowp float;
+precision lowp sampler2DArray;
 
 in vec2 v_texcoord;
 flat in int v_texpage;
 flat in vec4 v_fgcolor;
 
-uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
+uniform sampler2DArray u_atlas;
 
 out vec4 outColor;
 
 void main() {
-  vec4 sampled = vec4(0.0);
-  if (v_texpage == 0) {
-    sampled = texture(u_texture[0], v_texcoord);
-  } ${sampleBranches}
+  vec4 sampled = texture(u_atlas, vec3(v_texcoord, float(v_texpage)));
   outColor = v_fgcolor.a < 0.0
     ? sampled
     : vec4(v_fgcolor.rgb, sampled.a * v_fgcolor.a);
-}`);
-}
+}`;
 
 const enum Constants {
   INDICES_PER_CELL = 15,
@@ -107,9 +99,10 @@ export class GlyphRenderer extends Disposable {
   private readonly _vertexArrayObject: IWebGLVertexArrayObject;
   private readonly _projectionLocation: WebGLUniformLocation;
   private readonly _resolutionLocation: WebGLUniformLocation;
-  private readonly _textureLocation: WebGLUniformLocation;
-  private readonly _atlasTextures: GLTexture[];
   private readonly _attributesBuffer: WebGLBuffer;
+  private readonly _atlasTexture: WebGLTexture;
+  private readonly _atlasLayerVersions: Int32Array;
+  private readonly _atlasLayerSize: number;
 
   private _atlas: ITextureAtlas | undefined;
   private _activeBuffer: number = 0;
@@ -139,13 +132,13 @@ export class GlyphRenderer extends Disposable {
       TextureAtlas.maxTextureSize = throwIfFalsy(gl.getParameter(gl.MAX_TEXTURE_SIZE) as number | null);
     }
 
-    this._program = throwIfFalsy(createProgram(gl, vertexShaderSource, createFragmentShaderSource(TextureAtlas.maxAtlasPages)));
+    this._program = throwIfFalsy(createProgram(gl, vertexShaderSource, fragmentShaderSource));
     this._register(toDisposable(() => gl.deleteProgram(this._program)));
 
     // Uniform locations
     this._projectionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_projection'));
     this._resolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
-    this._textureLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_texture'));
+    const atlasLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_atlas'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -195,28 +188,23 @@ export class GlyphRenderer extends Disposable {
     gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 13 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.CELL_POSITION, 1);
 
-    // Setup static uniforms
     gl.useProgram(this._program);
-    const textureUnits = new Int32Array(TextureAtlas.maxAtlasPages);
-    for (let i = 0; i < TextureAtlas.maxAtlasPages; i++) {
-      textureUnits[i] = i;
-    }
-    gl.uniform1iv(this._textureLocation, textureUnits);
+    gl.uniform1i(atlasLocation, 0);
     gl.uniformMatrix4fv(this._projectionLocation, false, PROJECTION_MATRIX);
 
-    // Setup 1x1 red pixel textures for all potential atlas pages, if one of these invalid textures
-    // is ever drawn it will show characters as red rectangles.
-    this._atlasTextures = [];
-    for (let i = 0; i < TextureAtlas.maxAtlasPages; i++) {
-      const glTexture = new GLTexture(throwIfFalsy(gl.createTexture()));
-      this._register(toDisposable(() => gl.deleteTexture(glTexture.texture)));
-      gl.activeTexture(gl.TEXTURE0 + i);
-      gl.bindTexture(gl.TEXTURE_2D, glTexture.texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 0, 0, 255]));
-      this._atlasTextures[i] = glTexture;
-    }
+    // Allocate one TEXTURE_2D_ARRAY for the whole atlas: each page is a layer. Layers are
+    // populated lazily in render() when their TextureAtlas page version changes.
+    this._atlasLayerSize = TextureAtlas.atlasPageSize;
+    this._atlasTexture = throwIfFalsy(gl.createTexture());
+    this._register(toDisposable(() => gl.deleteTexture(this._atlasTexture)));
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._atlasTexture);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, this._atlasLayerSize, this._atlasLayerSize, TextureAtlas.maxAtlasPages);
+    this._atlasLayerVersions = new Int32Array(TextureAtlas.maxAtlasPages).fill(-1);
 
     // Allow drawing of transparent texture
     gl.enable(gl.BLEND);
@@ -360,32 +348,23 @@ export class GlyphRenderer extends Disposable {
     gl.bindBuffer(gl.ARRAY_BUFFER, this._attributesBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(0, bufferLength), gl.STREAM_DRAW);
 
-    // Bind the atlas page texture if they have changed
+    // Upload any atlas page whose canvas content has changed into its texture-array layer.
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._atlasTexture);
     for (let i = 0; i < this._atlas.pages.length; i++) {
-      if (this._atlas.pages[i].version !== this._atlasTextures[i].version) {
-        this._bindAtlasPageTexture(gl, this._atlas, i);
+      const page = this._atlas.pages[i];
+      if (page.version !== this._atlasLayerVersions[i]) {
+        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, page.canvas.width, page.canvas.height, 1, gl.RGBA, gl.UNSIGNED_BYTE, page.canvas);
+        this._atlasLayerVersions[i] = page.version;
       }
     }
 
-    // Draw the viewport
     gl.drawElementsInstanced(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_BYTE, 0, bufferLength / Constants.INDICES_PER_CELL);
   }
 
   public setAtlas(atlas: ITextureAtlas): void {
     this._atlas = atlas;
-    for (const glTexture of this._atlasTextures) {
-      glTexture.version = -1;
-    }
-  }
-
-  private _bindAtlasPageTexture(gl: IWebGL2RenderingContext, atlas: ITextureAtlas, i: number): void {
-    gl.activeTexture(gl.TEXTURE0 + i);
-    gl.bindTexture(gl.TEXTURE_2D, this._atlasTextures[i].texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlas.pages[i].canvas);
-    gl.generateMipmap(gl.TEXTURE_2D);
-    this._atlasTextures[i].version = atlas.pages[i].version;
+    this._atlasLayerVersions.fill(-1);
   }
 
   public setDimensions(dimensions: IRenderDimensions): void {
