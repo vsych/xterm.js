@@ -83,15 +83,15 @@ uniform sampler2DArray u_atlas;
 out vec4 outColor;
 
 void main() {
+  // Texels are uploaded premultiplied (see GlyphRenderer.render); un-premultiply for the
+  // emoji branch since the blend func is gl.SRC_ALPHA / gl.ONE_MINUS_SRC_ALPHA (straight).
   vec4 sampled = texture(u_atlas, vec3(v_texcoord, float(v_texpage)));
   if (v_fgcolor.a < 0.0) {
-    outColor = sampled;
+    outColor = sampled.a > 0.0 ? vec4(sampled.rgb / sampled.a, sampled.a) : vec4(0.0);
     return;
   }
   float glyphA = sampled.r * v_fgcolor.a;
   float decoA = sampled.g * v_decocolor.a;
-  // Composite decoration over glyph in premultiplied form, then convert back to straight
-  // alpha for the gl.SRC_ALPHA blend func.
   vec3 premul = v_decocolor.rgb * decoA + v_fgcolor.rgb * glyphA * (1.0 - decoA);
   float a = decoA + glyphA * (1.0 - decoA);
   outColor = a > 0.0 ? vec4(premul / a, a) : vec4(0.0);
@@ -372,8 +372,11 @@ export class GlyphRenderer extends Disposable {
     gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(0, bufferLength), gl.STREAM_DRAW);
 
     // Upload any atlas page whose canvas content has changed into its texture-array layer.
+    // Premultiply on upload so canvas's straight alpha bakes coverage into R/G — without this,
+    // AA edges (R=255, A<255) read back as fully opaque and glyph edges look blocky.
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._atlasTexture);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
     for (let i = 0; i < this._atlas.pages.length; i++) {
       const page = this._atlas.pages[i];
       if (page.version !== this._atlasLayerVersions[i]) {
@@ -381,6 +384,7 @@ export class GlyphRenderer extends Disposable {
         this._atlasLayerVersions[i] = page.version;
       }
     }
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
 
     gl.drawElementsInstanced(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_BYTE, 0, bufferLength / Constants.INDICES_PER_CELL);
   }
