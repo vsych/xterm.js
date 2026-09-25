@@ -62,10 +62,12 @@ export interface ITextureAtlas extends IDisposable {
   warmUp(): void;
 
   /**
-   * Call when a frame is being drawn, this will return true if the atlas was cleared to make room
-   * for a new set of glyphs.
+   * Incremented whenever cached glyph texture page mappings may be stale, such as after LRU page
+   * eviction or a texture clear. Renderers compare this against their own last-seen value and
+   * rebuild their model when it changes; a shared atlas can have many renderers, so this must not
+   * be a consume-once flag.
    */
-  beginFrame(): boolean;
+  readonly pageLayoutVersion: number;
 
   /** Advance the LRU clock. Call once per top-level render, NOT per retry. */
   bumpFrame(): void;

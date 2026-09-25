@@ -82,7 +82,7 @@ export class TextureAtlas implements ITextureAtlas {
   private _activePages: AtlasPage[] = [];
 
   private _tmpCanvas: HTMLCanvasElement;
-  // A temporary context that glyphs are drawn to before being transfered to the atlas.
+  // A temporary context that glyphs are drawn to before being transferred to the atlas.
   private _tmpCtx: CanvasRenderingContext2D;
 
   private _workBoundingBox: IBoundingBox = { top: 0, left: 0, bottom: 0, right: 0 };
@@ -122,6 +122,7 @@ export class TextureAtlas implements ITextureAtlas {
       page.canvas.remove();
     }
     this._onAddTextureAtlasCanvas.dispose();
+    this._onRemoveTextureAtlasCanvas.dispose();
   }
 
   public warmUp(): void {
@@ -150,7 +151,6 @@ export class TextureAtlas implements ITextureAtlas {
     }
   }
 
-  private _requestClearModel = false;
   private _currentFrame = 0;
   // Bumped once per top-level render, NOT per retry. If we bumped per retry, then a page touched
   // in retry N would have lastFrame < currentFrame in retry N+1, making it evictable — that
@@ -158,11 +158,9 @@ export class TextureAtlas implements ITextureAtlas {
   public bumpFrame(): void {
     this._currentFrame++;
   }
-  public beginFrame(): boolean {
-    const result = this._requestClearModel;
-    this._requestClearModel = false;
-    return result;
-  }
+
+  private _pageLayoutVersion = 0;
+  public get pageLayoutVersion(): number { return this._pageLayoutVersion; }
 
   public clearTexture(): void {
     if (this._pages[0].currentRow.x === 0 && this._pages[0].currentRow.y === 0) {
@@ -174,6 +172,11 @@ export class TextureAtlas implements ITextureAtlas {
     this._cacheMap.clear();
     this._cacheMapCombined.clear();
     this._didWarmUp = false;
+
+    // Invalidate renderer models so all texture pages are refreshed. The atlas may be shared, in
+    // which case the clearing renderer has cleared only its own model and every other owner still
+    // holds texture coords into the rows just wiped.
+    this._pageLayoutVersion++;
   }
 
   private _createNewPage(): AtlasPage | undefined {
@@ -204,7 +207,7 @@ export class TextureAtlas implements ITextureAtlas {
     if (this._activePages.indexOf(victim) === -1) {
       this._activePages.push(victim);
     }
-    this._requestClearModel = true;
+    this._pageLayoutVersion++;
     return victim;
   }
 
@@ -489,7 +492,7 @@ export class TextureAtlas implements ITextureAtlas {
 
     let customGlyph = false;
     if (this._config.customGlyphs !== false) {
-      customGlyph = tryDrawCustomGlyph(this._tmpCtx, chars, padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight, this._config.deviceCharWidth, this._config.deviceCharHeight, this._config.fontSize, this._config.devicePixelRatio, undefined, variantOffset);
+      customGlyph = tryDrawCustomGlyph(this._tmpCtx, chars, padding, padding, this._config.deviceCellWidth, this._config.deviceCellHeight, this._config.deviceCharWidth, this._config.deviceCharHeight, this._config.fontSize, this._config.devicePixelRatio, this._logService, undefined, variantOffset);
     }
 
     let chWidth: number;

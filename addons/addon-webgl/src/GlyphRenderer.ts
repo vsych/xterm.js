@@ -9,7 +9,7 @@ import { Disposable, toDisposable } from 'common/Lifecycle';
 import { Terminal } from '@xterm/xterm';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject, type IRasterizedGlyph, type ITextureAtlas } from './Types';
 import { createProgram, PROJECTION_MATRIX } from './WebglUtils';
-import type { IOptionsService } from 'common/services/Services';
+import type { ILogService, IOptionsService } from 'common/services/Services';
 import { allowRescaling, throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
 
 interface IVertices {
@@ -126,6 +126,8 @@ export class GlyphRenderer extends Disposable {
   private readonly _atlasLayerSize: number;
 
   private _atlas: ITextureAtlas | undefined;
+  private _lastSeenPageLayoutVersion: number = -1;
+  private _pageOverflowWarned: boolean = false;
   private _activeBuffer: number = 0;
   private readonly _vertices: IVertices = {
     count: 0,
@@ -140,7 +142,8 @@ export class GlyphRenderer extends Disposable {
     private readonly _terminal: Terminal,
     private readonly _gl: IWebGL2RenderingContext,
     private _dimensions: IRenderDimensions,
-    private readonly _optionsService: IOptionsService
+    private readonly _optionsService: IOptionsService,
+    private readonly _logService: ILogService
   ) {
     super();
 
@@ -153,7 +156,7 @@ export class GlyphRenderer extends Disposable {
       TextureAtlas.maxTextureSize = throwIfFalsy(gl.getParameter(gl.MAX_TEXTURE_SIZE) as number | null);
     }
 
-    this._program = throwIfFalsy(createProgram(gl, vertexShaderSource, fragmentShaderSource));
+    this._program = throwIfFalsy(createProgram(gl, vertexShaderSource, fragmentShaderSource, this._logService));
     this._register(toDisposable(() => gl.deleteProgram(this._program)));
 
     // Uniform locations
@@ -162,8 +165,9 @@ export class GlyphRenderer extends Disposable {
     const atlasLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_atlas'));
 
     // Create and set the vertex array object
-    this._vertexArrayObject = gl.createVertexArray();
-    gl.bindVertexArray(this._vertexArrayObject);
+    const vertexArrayObject = this._vertexArrayObject = gl.createVertexArray();
+    this._register(toDisposable(() => gl.deleteVertexArray(vertexArrayObject)));
+    gl.bindVertexArray(vertexArrayObject);
 
     // Setup a_unitquad, this defines the 4 vertices of a rectangle
     const unitQuadVertices = new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]);
@@ -238,8 +242,19 @@ export class GlyphRenderer extends Disposable {
     this.handleResize();
   }
 
+  /**
+   * Call when a frame is being drawn. Returns whether the full model must be rebuilt before
+   * rendering this frame because the atlas page layout changed since this renderer last drew.
+   */
   public beginFrame(): boolean {
-    return this._atlas ? this._atlas.beginFrame() : true;
+    if (!this._atlas) {
+      return true;
+    }
+    if (this._atlas.pageLayoutVersion !== this._lastSeenPageLayoutVersion) {
+      this._lastSeenPageLayoutVersion = this._atlas.pageLayoutVersion;
+      return true;
+    }
+    return false;
   }
 
   public updateCell(x: number, y: number, code: number, styleFlags: number, chars: string, width: number, fgR: number, fgG: number, fgB: number, fgA: number, dR: number, dG: number, dB: number, dA: number, leftClipBg: boolean): void {
@@ -380,10 +395,16 @@ export class GlyphRenderer extends Disposable {
     // Upload any atlas page whose canvas content has changed into its texture-array layer.
     // Premultiply on upload so canvas's straight alpha bakes coverage into R/G — without this,
     // AA edges (R=255, A<255) read back as fully opaque and glyph edges look blocky.
+    // Clamp defensively in case the atlas unexpectedly exceeds the texture array's layer count.
+    const pageCount = Math.min(this._atlas.pages.length, this._atlasLayerVersions.length);
+    if (this._atlas.pages.length > this._atlasLayerVersions.length && !this._pageOverflowWarned) {
+      this._pageOverflowWarned = true;
+      this._logService.warn(`Atlas page count (${this._atlas.pages.length}) exceeds the renderer's texture capacity (${this._atlasLayerVersions.length}), some glyphs will not render correctly`);
+    }
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._atlasTexture);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-    for (let i = 0; i < this._atlas.pages.length; i++) {
+    for (let i = 0; i < pageCount; i++) {
       const page = this._atlas.pages[i];
       if (page.version !== this._atlasLayerVersions[i]) {
         gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, page.canvas.width, page.canvas.height, 1, gl.RGBA, gl.UNSIGNED_BYTE, page.canvas);
@@ -397,6 +418,11 @@ export class GlyphRenderer extends Disposable {
 
   public setAtlas(atlas: ITextureAtlas): void {
     this._atlas = atlas;
+    this._lastSeenPageLayoutVersion = -1;
+    this.invalidateAtlasTextures();
+  }
+
+  public invalidateAtlasTextures(): void {
     this._atlasLayerVersions.fill(-1);
   }
 
