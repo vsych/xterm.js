@@ -140,6 +140,10 @@ export class TextureAtlas implements ITextureAtlas {
           const rasterizedGlyph = this._drawToCache(i, 0, false, undefined);
           if (rasterizedGlyph !== NULL_RASTERIZED_GLYPH) {
             this._cacheMap.set(i, 0, rasterizedGlyph);
+            // Without this, page eviction can't remove warm-up entries from the cache (the
+            // optional chain on `g.removeFromCache?.()` silently skips them), leaving stale
+            // (page, pos) references that render as whatever glyph now occupies that slot.
+            rasterizedGlyph.removeFromCache = () => this._cacheMap.delete(i, 0);
           }
         }
       });
@@ -148,8 +152,13 @@ export class TextureAtlas implements ITextureAtlas {
 
   private _requestClearModel = false;
   private _currentFrame = 0;
-  public beginFrame(): boolean {
+  // Bumped once per top-level render, NOT per retry. If we bumped per retry, then a page touched
+  // in retry N would have lastFrame < currentFrame in retry N+1, making it evictable — that
+  // cascades into the eviction spiral we hit under atlas-stress workloads.
+  public bumpFrame(): void {
     this._currentFrame++;
+  }
+  public beginFrame(): boolean {
     const result = this._requestClearModel;
     this._requestClearModel = false;
     return result;
@@ -167,7 +176,7 @@ export class TextureAtlas implements ITextureAtlas {
     this._didWarmUp = false;
   }
 
-  private _createNewPage(): AtlasPage {
+  private _createNewPage(): AtlasPage | undefined {
     if (TextureAtlas.maxAtlasPages && this._pages.length >= TextureAtlas.maxAtlasPages) {
       return this._evictLruPage();
     }
@@ -178,13 +187,19 @@ export class TextureAtlas implements ITextureAtlas {
     return newPage;
   }
 
-  private _evictLruPage(): AtlasPage {
-    let victim = this._pages[0];
-    for (let i = 1; i < this._pages.length; i++) {
-      if (this._pages[i].lastFrame < victim.lastFrame) {
-        victim = this._pages[i];
+  // Returns undefined if every page has glyphs already referenced this frame. Evicting in that
+  // case would steal a page whose glyphs the current walk is still emitting vertices for, which
+  // causes visible corruption.
+  private _evictLruPage(): AtlasPage | undefined {
+    let victim: AtlasPage | undefined;
+    for (let i = 0; i < this._pages.length; i++) {
+      const p = this._pages[i];
+      if (p.lastFrame >= this._currentFrame) continue;
+      if (!victim || p.lastFrame < victim.lastFrame) {
+        victim = p;
       }
     }
+    if (!victim) return undefined;
     victim.evict();
     if (this._activePages.indexOf(victim) === -1) {
       this._activePages.push(victim);
@@ -659,6 +674,7 @@ export class TextureAtlas implements ITextureAtlas {
       // If there are no active pages (the last smallest 4 were merged), create a new one
       if (this._activePages.length === 0) {
         const newPage = this._createNewPage();
+        if (!newPage) return NULL_RASTERIZED_GLYPH;
         activePage = newPage;
         activeRow = newPage.currentRow;
         activeRow.height = rasterizedGlyph.size.y;
@@ -727,6 +743,7 @@ export class TextureAtlas implements ITextureAtlas {
             } else {
               // Create a new page if there is no room
               const newPage = this._createNewPage();
+              if (!newPage) return NULL_RASTERIZED_GLYPH;
               activePage = newPage;
               activeRow = newPage.currentRow;
               activeRow.height = rasterizedGlyph.size.y;

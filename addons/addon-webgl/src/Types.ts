@@ -67,6 +67,9 @@ export interface ITextureAtlas extends IDisposable {
    */
   beginFrame(): boolean;
 
+  /** Advance the LRU clock. Call once per top-level render, NOT per retry. */
+  bumpFrame(): void;
+
   /**
    * Clear all glyphs from the texture atlas.
    */

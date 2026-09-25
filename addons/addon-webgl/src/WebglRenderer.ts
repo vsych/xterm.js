@@ -366,6 +366,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
       return;
     }
 
+    this._charAtlas?.bumpFrame();
     if (this._glyphRenderer.value.beginFrame()) {
       this._clearModel(true);
       this._updateModel(0, this._terminal.rows - 1);
@@ -387,6 +388,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
     if (!this._cursorBlinkStateManager.value || this._cursorBlinkStateManager.value.isCursorVisible) {
       this._rectangleRenderer.value.renderCursor();
     }
+    // Debug hook for the demo FPS overlay; no-op when unset.
+    (globalThis as any).__webglOnFrame?.();
   }
 
   private _updateCursorBlink(): void {

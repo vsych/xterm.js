@@ -70,7 +70,7 @@ void main() {
 // A negative v_fgcolor.a is the sentinel for "this glyph is colored (e.g. emoji), sample
 // the texture directly without tinting".
 const fragmentShaderSource = `#version 300 es
-precision lowp float;
+precision mediump float;
 precision lowp sampler2DArray;
 
 in vec2 v_texcoord;
@@ -82,16 +82,22 @@ uniform sampler2DArray u_atlas;
 
 out vec4 outColor;
 
+// Stem darkening: lifts mid-coverage pixels so antialiased stems read as thick as macOS's
+// CoreText. Without it, alpha-only AA looks anemic at small sizes — this is the same trick
+// FreeType's stem-darkening / Apple's CoreText apply at the rasterizer level. The 0.85
+// exponent maps coverage 0.5 -> 0.56, leaving 0 and 1 untouched.
+const float STEM_DARKEN = 0.85;
+
 void main() {
-  // Texels are uploaded premultiplied (see GlyphRenderer.render); un-premultiply for the
-  // emoji branch since the blend func is gl.SRC_ALPHA / gl.ONE_MINUS_SRC_ALPHA (straight).
   vec4 sampled = texture(u_atlas, vec3(v_texcoord, float(v_texpage)));
   if (v_fgcolor.a < 0.0) {
     outColor = sampled.a > 0.0 ? vec4(sampled.rgb / sampled.a, sampled.a) : vec4(0.0);
     return;
   }
-  float glyphA = sampled.r * v_fgcolor.a;
-  float decoA = sampled.g * v_decocolor.a;
+  float glyphA = pow(sampled.r, STEM_DARKEN) * v_fgcolor.a;
+  float decoA = pow(sampled.g, STEM_DARKEN) * v_decocolor.a;
+  // Composite decoration over glyph; output premultiplied alpha so the GPU blend correctly
+  // composites against whatever the rect renderer drew.
   vec3 premul = v_decocolor.rgb * decoA + v_fgcolor.rgb * glyphA * (1.0 - decoA);
   float a = decoA + glyphA * (1.0 - decoA);
   outColor = a > 0.0 ? vec4(premul / a, a) : vec4(0.0);
