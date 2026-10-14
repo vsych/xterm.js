@@ -865,7 +865,9 @@ export class TextureAtlas implements ITextureAtlas {
     }
     boundingBox.right = width;
     found = false;
-    for (let x = padding + width - 1; x >= padding; x--) {
+    // Don't scan past the canvas edge, those reads wrap into the next row and can make a glyph
+    // wider than an atlas page, which no page can ever fit
+    for (let x = Math.min(padding + width, this._tmpCanvas.width) - 1; x >= padding; x--) {
       for (let y = 0; y < height; y++) {
         const alphaOffset = y * this._tmpCanvas.width * 4 + x * 4 + 3;
         if (imageData.data[alphaOffset] !== 0) {
