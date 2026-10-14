@@ -168,6 +168,12 @@ export class WebglRenderer extends Disposable implements IRenderer {
       }
       this._canvas.parentElement?.removeChild(this._canvas);
       removeTerminalFromCache(this._terminal);
+      // Release the context's GPU memory now rather than when the canvas is garbage collected,
+      // this also frees its slot in the browser's limit on active WebGL contexts. The
+      // webglcontextlost listener is already disposed so this won't fire onContextLoss.
+      if (!this._gl.isContextLost()) {
+        this._gl.getExtension('WEBGL_lose_context')?.loseContext();
+      }
     }));
   }
 
