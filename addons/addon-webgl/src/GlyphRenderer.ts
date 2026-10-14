@@ -121,8 +121,8 @@ export class GlyphRenderer extends Disposable {
   private readonly _projectionLocation: WebGLUniformLocation;
   private readonly _resolutionLocation: WebGLUniformLocation;
   private readonly _attributesBuffer: WebGLBuffer;
-  private readonly _atlasTexture: WebGLTexture;
-  private readonly _atlasLayerVersions: Int32Array;
+  private _atlasTexture: WebGLTexture;
+  private _atlasLayerVersions: Int32Array;
   private readonly _atlasLayerSize: number;
 
   private _atlas: ITextureAtlas | undefined;
@@ -221,18 +221,14 @@ export class GlyphRenderer extends Disposable {
     gl.uniformMatrix4fv(this._projectionLocation, false, PROJECTION_MATRIX);
 
     // Allocate one TEXTURE_2D_ARRAY for the whole atlas: each page is a layer. Layers are
-    // populated lazily in render() when their TextureAtlas page version changes.
+    // populated lazily in render() when their TextureAtlas page version changes. The array starts
+    // with a single layer and grows with the atlas, since texStorage3D allocates every layer up
+    // front and most terminals only ever use one page.
     this._atlasLayerSize = TextureAtlas.atlasPageSize;
-    this._atlasTexture = throwIfFalsy(gl.createTexture());
+    this._atlasTexture = this._createAtlasTexture(1);
+    this._atlasLayerVersions = new Int32Array(1).fill(-1);
+    // Read the field at dispose time as growing replaces the texture
     this._register(toDisposable(() => gl.deleteTexture(this._atlasTexture)));
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this._atlasTexture);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, this._atlasLayerSize, this._atlasLayerSize, TextureAtlas.maxAtlasPages);
-    this._atlasLayerVersions = new Int32Array(TextureAtlas.maxAtlasPages).fill(-1);
 
     // Allow drawing of transparent texture
     gl.enable(gl.BLEND);
@@ -392,6 +388,10 @@ export class GlyphRenderer extends Disposable {
     gl.bindBuffer(gl.ARRAY_BUFFER, this._attributesBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(0, bufferLength), gl.STREAM_DRAW);
 
+    if (this._atlas.pages.length > this._atlasLayerVersions.length) {
+      this._growAtlasTexture(this._atlas.pages.length);
+    }
+
     // Upload any atlas page whose canvas content has changed into its texture-array layer.
     // Premultiply on upload so canvas's straight alpha bakes coverage into R/G — without this,
     // AA edges (R=255, A<255) read back as fully opaque and glyph edges look blocky.
@@ -424,6 +424,34 @@ export class GlyphRenderer extends Disposable {
 
   public invalidateAtlasTextures(): void {
     this._atlasLayerVersions.fill(-1);
+  }
+
+  private _createAtlasTexture(layerCount: number): WebGLTexture {
+    const gl = this._gl;
+    const texture = throwIfFalsy(gl.createTexture());
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, this._atlasLayerSize, this._atlasLayerSize, layerCount);
+    return texture;
+  }
+
+  /**
+   * Replaces the atlas texture with one that has at least `pageCount` layers, capped at
+   * maxAtlasPages. Texture storage is immutable so it can't be resized in place, the pages are
+   * re-uploaded from their canvases by render().
+   */
+  private _growAtlasTexture(pageCount: number): void {
+    const layerCount = Math.min(TextureAtlas.maxAtlasPages ?? pageCount, Math.max(pageCount, this._atlasLayerVersions.length * 2));
+    if (layerCount <= this._atlasLayerVersions.length) {
+      return;
+    }
+    this._gl.deleteTexture(this._atlasTexture);
+    this._atlasTexture = this._createAtlasTexture(layerCount);
+    this._atlasLayerVersions = new Int32Array(layerCount).fill(-1);
   }
 
   public setDimensions(dimensions: IRenderDimensions): void {
