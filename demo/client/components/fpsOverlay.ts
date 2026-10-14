@@ -31,6 +31,7 @@ export function attachFpsOverlay(): IFpsOverlayHandle {
   } as Partial<CSSStyleDeclaration>);
   root.textContent = 'rAF  --\ndraw --';
   document.body.appendChild(root);
+  const win = root.ownerDocument.defaultView ?? window;
 
   let rafCount = 0;
   let drawCount = 0;
@@ -58,13 +59,13 @@ export function attachFpsOverlay(): IFpsOverlayHandle {
         `rAF  ${String(lastRafFps).padStart(3, ' ')}\n` +
         `draw ${String(lastDrawFps).padStart(3, ' ')}`;
     }
-    rafHandle = requestAnimationFrame(tick);
+    rafHandle = win.requestAnimationFrame(tick);
   };
-  rafHandle = requestAnimationFrame(tick);
+  rafHandle = win.requestAnimationFrame(tick);
 
   return {
     destroy(): void {
-      cancelAnimationFrame(rafHandle);
+      win.cancelAnimationFrame(rafHandle);
       (globalThis as any).__webglOnFrame = prevHook;
       root.remove();
     }

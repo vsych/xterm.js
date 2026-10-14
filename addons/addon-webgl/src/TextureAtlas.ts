@@ -8,7 +8,7 @@ import { DIM_OPACITY, TEXT_BASELINE } from './Constants';
 import { tryDrawCustomGlyph } from './customGlyphs/CustomGlyphRasterizer';
 import { computeNextVariantOffset, treatGlyphAsBackgroundColor, isRestrictedPowerlineGlyph, throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
 import { IBoundingBox, ICharAtlasConfig, IRasterizedGlyph, ITextureAtlas } from './Types';
-import { NULL_COLOR, channels, color, rgba } from 'common/Color';
+import { channels, color, rgba } from 'common/Color';
 import { TwoKeyMap } from 'common/MultiKeyMap';
 import { IdleTaskQueue } from 'common/TaskQueue';
 import { IColor } from 'common/Types';
