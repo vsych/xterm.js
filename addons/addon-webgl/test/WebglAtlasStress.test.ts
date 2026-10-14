@@ -18,7 +18,7 @@ interface ITestTextureAtlas {
 }
 
 interface ITestGlyphRenderer {
-  readonly _atlasTextures: ReadonlyArray<unknown>;
+  readonly _atlasLayerVersions: ArrayLike<number>;
 }
 
 interface ITestRenderer {
@@ -58,7 +58,7 @@ interface ITestWindow {
 
 interface IAtlasState {
   additions: number;
-  atlasTextures: number;
+  atlasLayers: number;
   maxPages: number;
 }
 
@@ -111,7 +111,7 @@ async function getAtlasState(ctx: ITestContext): Promise<IAtlasState> {
     }
     return {
       additions: stats.additions,
-      atlasTextures: glyphRenderer._atlasTextures.length,
+      atlasLayers: glyphRenderer._atlasLayerVersions.length,
       maxPages: stats.maxPages
     };
   });
@@ -258,7 +258,7 @@ test.describe('WebGL atlas TUI stress (#6038)', () => {
         await writeAndWaitForRender(ctx, frame);
       }
       const glyphsPerViewport = 23 * 40 - 1;
-      for (let chunk = 0; chunk < 4; chunk++) {
+      for (let chunk = 0; chunk < 8; chunk++) {
         await writeAndWaitForRender(ctx, `\x1b[2J\x1b[H${generateUniqueGlyphFlood(glyphsPerViewport, 80, chunk * glyphsPerViewport)}`);
       }
       await writeAndWaitForRender(ctx, '\x1b[?1049l');
@@ -267,7 +267,7 @@ test.describe('WebGL atlas TUI stress (#6038)', () => {
       const state = await getAtlasState(ctx);
       expect(state.additions, 'stress workload must add atlas pages').toBeGreaterThan(0);
       expect(state.maxPages, 'stress workload must exercise multiple atlas pages').toBeGreaterThan(1);
-      expect(state.maxPages, 'atlas pages must remain within renderer texture capacity').toBeLessThanOrEqual(state.atlasTextures);
+      expect(state.maxPages, 'atlas pages must remain within renderer texture capacity').toBeLessThanOrEqual(state.atlasLayers);
       expect(errors, `renderer must not throw during TUI stress: ${errors[0] ?? ''}`).toEqual([]);
 
       const primaryText = await ctx.page.evaluate(() => {

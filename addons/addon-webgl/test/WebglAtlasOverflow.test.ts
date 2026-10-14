@@ -14,6 +14,7 @@ type TestTerminalConstructor = new (options?: ITerminalOptions & ITerminalInitOn
 type TestWebglAddonConstructor = new (options?: IWebglAddonOptions) => ITestWebglAddon;
 
 interface ITestTextureAtlasConstructor {
+  readonly atlasPageSize: number;
   maxAtlasPages: number | undefined;
   maxTextureSize: number | undefined;
 }
@@ -26,12 +27,10 @@ interface ITestTextureAtlas {
   constructor: ITestTextureAtlasConstructor;
   pages: ITestAtlasPage[];
   pageLayoutVersion: number;
-  _overflowSizePage?: ITestAtlasPage;
-  _textureSize: number;
 }
 
 interface ITestGlyphRenderer {
-  _atlasTextures: unknown[];
+  _atlasLayerVersions: ArrayLike<number>;
 }
 
 interface ITestRenderer {
@@ -65,7 +64,6 @@ interface ITestWebglAddon extends WebglAddon {
 }
 
 interface IAtlasEventStats {
-  removals: number;
   maxPages: number;
 }
 
@@ -86,10 +84,9 @@ interface IAtlasLimits {
 
 interface IAtlasState {
   pages: number;
-  atlasTextures: number;
+  maxAtlasPages: number;
+  atlasLayers: number;
   pageLayoutVersion: number;
-  overflowPageCreated: boolean;
-  removals: number;
   maxPages: number;
 }
 
@@ -209,14 +206,12 @@ async function installAtlasEventStats(ctx: ITestContext): Promise<void> {
       return false;
     }
     const stats: IAtlasEventStats = {
-      removals: 0,
       maxPages: atlas.pages.length
     };
     w.atlasEventStats = stats;
     w.addon.onAddTextureAtlasCanvas(() => {
       stats.maxPages = Math.max(stats.maxPages, atlas.pages.length);
     });
-    w.addon.onRemoveTextureAtlasCanvas(() => stats.removals++);
     return true;
   });
   expect(installed, 'atlas event tracking must be installed').toBe(true);
@@ -229,15 +224,14 @@ async function getAtlasState(ctx: ITestContext): Promise<IAtlasState> {
     const atlas = renderer?._charAtlas;
     const glyphRenderer = renderer?._glyphRenderer?.value;
     const stats = w.atlasEventStats;
-    if (!atlas || !glyphRenderer || !stats) {
+    if (!atlas || !glyphRenderer || !stats || atlas.constructor.maxAtlasPages === undefined) {
       return undefined;
     }
     return {
       pages: atlas.pages.length,
-      atlasTextures: glyphRenderer._atlasTextures.length,
+      maxAtlasPages: atlas.constructor.maxAtlasPages,
+      atlasLayers: glyphRenderer._atlasLayerVersions.length,
       pageLayoutVersion: atlas.pageLayoutVersion,
-      overflowPageCreated: !!atlas._overflowSizePage,
-      removals: stats.removals,
       maxPages: stats.maxPages
     };
   });
@@ -328,7 +322,7 @@ test.describe('atlas page overflow (#6038)', () => {
   test.skip(({ browserName }) => browserName !== 'chromium');
   test.describe.configure({ timeout: 90000 });
 
-  test('evicts normal pages when the page cap cannot be reduced by merging', async ({ browser }) => {
+  test('evicts least recently used pages at the page cap', async ({ browser }) => {
     const ctx = await createTestContext(browser);
     const errors: string[] = [];
     const onError = (error: Error): void => { errors.push(error.message); };
@@ -361,15 +355,15 @@ test.describe('atlas page overflow (#6038)', () => {
         await ctx.proxy.write('\x1b[H\x1b[2J' + generateUniqueGlyphFlood(glyphsPerChunk, 80, chunk * glyphsPerChunk));
         await ctx.page.waitForTimeout(50);
         const state = await getAtlasState(ctx);
-        if (state.removals > 0 || state.pages > state.atlasTextures || errors.length > 0) {
+        if (state.pageLayoutVersion > initialState.pageLayoutVersion || state.pages > state.maxAtlasPages || errors.length > 0) {
           break;
         }
       }
 
       const evictionState = await getAtlasState(ctx);
-      expect(evictionState.removals, 'normal atlas pages must be evicted at the page cap').toBeGreaterThan(0);
-      expect(evictionState.pageLayoutVersion, 'eviction must invalidate renderer models').toBeGreaterThan(initialState.pageLayoutVersion);
-      expect(evictionState.maxPages, 'atlas pages must stay within renderer texture capacity').toBeLessThanOrEqual(evictionState.atlasTextures);
+      expect(evictionState.pageLayoutVersion, 'a page must be evicted at the page cap, invalidating renderer models').toBeGreaterThan(initialState.pageLayoutVersion);
+      expect(evictionState.maxPages, 'atlas pages must stay within the page cap').toBeLessThanOrEqual(evictionState.maxAtlasPages);
+      expect(evictionState.atlasLayers, 'the texture array must stay within the page cap').toBeLessThanOrEqual(evictionState.maxAtlasPages);
       expect(errors, `renderer must not throw during atlas eviction: ${errors[0] ?? ''}`).toEqual([]);
 
       await writeToBAndWaitForRender(ctx, `\x1b[2;1H${POST_EVICTION_TEXT}`);
@@ -392,7 +386,6 @@ test.describe('atlas page overflow (#6038)', () => {
       await refreshAndWaitForRender(ctx, 'termB');
       const refreshedState = await getAtlasState(ctx);
       expect(refreshedState.pageLayoutVersion, 'an unchanged full refresh must not evict again').toBe(stableState.pageLayoutVersion);
-      expect(refreshedState.removals, 'an unchanged full refresh must not remove more pages').toBe(stableState.removals);
     } finally {
       ctx.page.off('pageerror', onError);
       await restoreAtlasLimits(ctx, limits).catch(() => {});
@@ -400,7 +393,7 @@ test.describe('atlas page overflow (#6038)', () => {
     }
   });
 
-  test('evicts before adding an oversized glyph page at the page cap', async ({ browser }) => {
+  test('renders a glyph wider than an atlas page at the page cap', async ({ browser }) => {
     const ctx = await createTestContext(browser);
     const errors: string[] = [];
     const onError = (error: Error): void => { errors.push(error.message); };
@@ -417,15 +410,13 @@ test.describe('atlas page overflow (#6038)', () => {
 
       let state = await getAtlasState(ctx);
       let offset = 0;
-      for (let chunk = 0; chunk < 120 && state.pages < state.atlasTextures; chunk++) {
-        const glyphCount = state.pages < state.atlasTextures - 1 ? 200 : 25;
-        await ctx.proxy.write('\x1b[H\x1b[2J' + generateUniqueGlyphFlood(glyphCount, 160, offset));
+      for (let chunk = 0; chunk < 120 && state.pages < state.maxAtlasPages; chunk++) {
+        await ctx.proxy.write('\x1b[H\x1b[2J' + generateUniqueGlyphFlood(200, 160, offset));
         await ctx.page.waitForTimeout(50);
-        offset += glyphCount;
+        offset += 200;
         state = await getAtlasState(ctx);
       }
-      expect(state.pages, 'normal atlas pages must reach the texture capacity before the oversized glyph').toBe(state.atlasTextures);
-      expect(state.overflowPageCreated, 'normal glyph filling must not create the oversized page').toBe(false);
+      expect(state.pages, 'atlas pages must reach the page cap before the oversized glyph').toBe(state.maxAtlasPages);
       expect(errors, `renderer must not fail while filling normal pages: ${errors[0] ?? ''}`).toEqual([]);
 
       await writeAndWaitForRender(ctx, '\x1b[H\x1b[2K\x1b[24;1H');
@@ -439,8 +430,9 @@ test.describe('atlas page overflow (#6038)', () => {
           throw new Error('renderer and atlas must exist');
         }
         const cellWidth = renderer.dimensions.device.cell.width;
-        const length = Math.min(w.term.cols - 1, Math.ceil(atlas._textureSize / cellWidth) + 32);
-        if (length * cellWidth <= atlas._textureSize) {
+        const pageSize = atlas.constructor.atlasPageSize;
+        const length = Math.min(w.term.cols - 1, Math.ceil(pageSize / cellWidth) + 32);
+        if (length * cellWidth <= pageSize) {
           throw new Error('joined glyph must be wider than a normal atlas page');
         }
         const marker = 'W'.repeat(length);
@@ -448,15 +440,12 @@ test.describe('atlas page overflow (#6038)', () => {
         return length;
       });
 
-      const beforeOversized = await getAtlasState(ctx);
       await ctx.proxy.write(`\x1b[H${'W'.repeat(joinedLength)}`);
       await ctx.page.waitForTimeout(50);
       const oversizedState = await getAtlasState(ctx);
-      expect(oversizedState.overflowPageCreated, 'the joined glyph must use the oversized atlas page').toBe(true);
-      expect(oversizedState.removals, 'normal pages must be evicted before adding the oversized page').toBeGreaterThan(beforeOversized.removals);
-      expect(oversizedState.maxPages, 'oversized page creation must stay within renderer texture capacity').toBeLessThanOrEqual(oversizedState.atlasTextures);
-      expect(oversizedState.pageLayoutVersion, 'oversized eviction must invalidate renderer models').toBeGreaterThan(beforeOversized.pageLayoutVersion);
-      expect(errors, `renderer must not throw while adding the oversized page: ${errors[0] ?? ''}`).toEqual([]);
+      expect(oversizedState.maxPages, 'the oversized glyph must stay within the page cap').toBeLessThanOrEqual(oversizedState.maxAtlasPages);
+      expect(oversizedState.atlasLayers, 'the texture array must stay within the page cap').toBeLessThanOrEqual(oversizedState.maxAtlasPages);
+      expect(errors, `renderer must not throw while adding the oversized glyph: ${errors[0] ?? ''}`).toEqual([]);
 
       const wideSignatures = await captureRowSignatures(ctx, TERM_SELECTOR, 160, 1, sampleCols, 'atlas-overflow-wide-after');
       for (let i = 0; i < sampleCols.length; i++) {
@@ -467,7 +456,6 @@ test.describe('atlas page overflow (#6038)', () => {
       await refreshAndWaitForRender(ctx, 'term');
       const refreshedState = await getAtlasState(ctx);
       expect(refreshedState.pageLayoutVersion, 'oversized glyph refresh must settle without another eviction').toBe(stableState.pageLayoutVersion);
-      expect(refreshedState.removals, 'oversized glyph refresh must not remove more pages').toBe(stableState.removals);
       const wideAfterRefresh = await captureRowSignatures(ctx, TERM_SELECTOR, 160, 1, sampleCols, 'atlas-overflow-wide-refreshed');
       for (let i = 0; i < sampleCols.length; i++) {
         expectSignatureMatches(wideAfterRefresh[i], wideSignatures[i], `wide glyph col ${sampleCols[i]} changed after refresh`);
@@ -475,6 +463,47 @@ test.describe('atlas page overflow (#6038)', () => {
     } finally {
       ctx.page.off('pageerror', onError);
       await restoreAtlasLimits(ctx, limits).catch(() => {});
+      await ctx.page.close();
+    }
+  });
+});
+
+test.describe('atlas texture growth', () => {
+  test.skip(({ browserName }) => browserName !== 'chromium');
+  test.describe.configure({ timeout: 90000 });
+
+  test('grows the texture array with the atlas and keeps existing glyphs', async ({ browser }) => {
+    const ctx = await createTestContext(browser);
+    const errors: string[] = [];
+    const onError = (error: Error): void => { errors.push(error.message); };
+    ctx.page.on('pageerror', onError);
+    try {
+      await openTerminal(ctx, { cols: 80, rows: 24 });
+      await loadWebglStrict(ctx);
+      await installAtlasEventStats(ctx);
+
+      await writeAndWaitForRender(ctx, `\x1b[H${NORMAL_HEADER}`);
+      let state = await getAtlasState(ctx);
+      expect(state.pages, 'a short line must fit on one atlas page').toBe(1);
+      expect(state.atlasLayers, 'the texture array must start with one layer').toBe(1);
+      const reference = await captureRowSignatures(ctx, TERM_SELECTOR, 80, 1, NORMAL_HEADER_COLS, 'atlas-growth-reference');
+
+      const glyphsPerChunk = 22 * 40 - 1;
+      for (let chunk = 0; chunk < 40 && state.pages < 3; chunk++) {
+        await writeAndWaitForRender(ctx, `\x1b[2;1H\x1b[J${generateUniqueGlyphFlood(glyphsPerChunk, 80, chunk * glyphsPerChunk)}`);
+        state = await getAtlasState(ctx);
+      }
+      expect(state.pages, 'unique glyphs must add atlas pages').toBeGreaterThanOrEqual(3);
+      expect(state.atlasLayers, 'the texture array must grow to hold every page').toBeGreaterThanOrEqual(state.pages);
+      expect(state.atlasLayers, 'the texture array must stay within the page cap').toBeLessThanOrEqual(state.maxAtlasPages);
+      expect(errors, `renderer must not throw while growing: ${errors[0] ?? ''}`).toEqual([]);
+
+      const after = await captureRowSignatures(ctx, TERM_SELECTOR, 80, 1, NORMAL_HEADER_COLS, 'atlas-growth-after');
+      for (let i = 0; i < NORMAL_HEADER_COLS.length; i++) {
+        expectSignatureMatches(after[i], reference[i], `header col ${NORMAL_HEADER_COLS[i]} changed after the texture array grew`);
+      }
+    } finally {
+      ctx.page.off('pageerror', onError);
       await ctx.page.close();
     }
   });
